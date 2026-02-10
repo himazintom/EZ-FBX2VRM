@@ -69,6 +69,18 @@ _Z_UP_TO_Y_UP = np.array([
     [0,  0,  0,  1],
 ], dtype=np.float32)
 
+# Bone coordinate fix: +90° around Y axis
+# Mesh vertices (local space) and bone transforms (scene root) use different
+# lateral axes due to the mesh node's axis-swap transform baked by Assimp.
+# This rotation aligns bone X/Z with the mesh's rotated X/Z.
+# (x, y, z) -> (z, y, -x)
+_BONE_AXIS_FIX = np.array([
+    [ 0, 0, 1, 0],
+    [ 0, 1, 0, 0],
+    [-1, 0, 0, 0],
+    [ 0, 0, 0, 1],
+], dtype=np.float32)
+
 
 def _detect_z_up(fbx_data: 'FBXData') -> bool:
     """Return True if model appears to be Z-up (Z extent >> Y extent)."""
@@ -213,10 +225,11 @@ class VRMBuilder:
         for bi, bone in enumerate(bones):
             node = Node(name=bone.name)
 
-            # For root bones in Z-up models, prepend coordinate conversion
             local_xform = bone.local_transform
+            # For root bones, apply axis alignment so bones match the
+            # Z_UP_TO_Y_UP-rotated mesh coordinate system
             if self._coord_fix is not None and bone.parent_index < 0:
-                local_xform = self._coord_fix @ local_xform
+                local_xform = _BONE_AXIS_FIX @ local_xform
 
             # Decompose local transform into TRS
             t, r, s = _decompose_matrix(local_xform)
@@ -275,6 +288,8 @@ class VRMBuilder:
                         "index": tex_idx,
                         "texCoord": 0,
                     }
+                    # When texture is present, use white factor so texture is not tinted
+                    material.pbrMetallicRoughness["baseColorFactor"] = [1.0, 1.0, 1.0, 1.0]
 
             material.doubleSided = True
             self.gltf.materials.append(material)
@@ -446,13 +461,13 @@ class VRMBuilder:
 
         # Compute global transforms from the node hierarchy (local transforms)
         # to ensure consistency with the glTF node tree.
-        # Root bones include the Z-up->Y-up rotation if applicable.
+        # Root bones get the same axis fix applied in _build_skeleton.
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
             local = bone.local_transform
             if bone.parent_index < 0 and self._coord_fix is not None:
-                local = self._coord_fix @ local
+                local = _BONE_AXIS_FIX @ local
             if bone.parent_index < 0:
                 global_xforms[i] = local
             else:
