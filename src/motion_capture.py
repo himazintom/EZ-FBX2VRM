@@ -3,11 +3,15 @@ Motion capture module using MediaPipe + OpenCV.
 
 Captures webcam video, runs MediaPipe Pose estimation,
 and provides landmark data for the pose solver.
+
+Uses the MediaPipe Tasks API (0.10.x+) with PoseLandmarker.
 """
 
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 from PIL import Image as PILImage
@@ -19,10 +23,45 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks.python import vision
+    from mediapipe.tasks.python.core import base_options as base_options_module
 except ImportError:
     mp = None
 
 logger = logging.getLogger(__name__)
+
+# Model file path - look in models/ directory next to the project root
+_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+_MODEL_FILE = _MODEL_DIR / "pose_landmarker_lite.task"
+
+# Landmark connection pairs for skeleton drawing
+_POSE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 7),   # left eye
+    (0, 4), (4, 5), (5, 6), (6, 8),   # right eye
+    (9, 10),                            # mouth
+    (11, 12),                           # shoulders
+    (11, 13), (13, 15),                # left arm
+    (12, 14), (14, 16),                # right arm
+    (11, 23), (12, 24),                # torso sides
+    (23, 24),                           # hips
+    (23, 25), (25, 27),                # left leg
+    (24, 26), (26, 28),                # right leg
+    (27, 29), (29, 31),                # left foot
+    (28, 30), (30, 32),                # right foot
+    (15, 17), (15, 19), (15, 21),      # left hand
+    (16, 18), (16, 20), (16, 22),      # right hand
+]
+
+
+class _LandmarkCompat:
+    """Adapter to make new API landmarks compatible with pose_solver expectations."""
+    __slots__ = ('x', 'y', 'z', 'visibility')
+
+    def __init__(self, x, y, z, visibility=1.0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.visibility = visibility
 
 
 class MotionCapture:
@@ -32,7 +71,7 @@ class MotionCapture:
     Usage:
         mc = MotionCapture()
         mc.start(camera_index=0)
-        frame, landmarks = mc.get_latest()
+        frame, landmarks, world_landmarks = mc.get_latest()
         mc.stop()
     """
 
@@ -41,6 +80,11 @@ class MotionCapture:
             raise ImportError("opencv-python is required: pip install opencv-python")
         if mp is None:
             raise ImportError("mediapipe is required: pip install mediapipe")
+        if not _MODEL_FILE.exists():
+            raise FileNotFoundError(
+                f"Pose landmarker model not found: {_MODEL_FILE}\n"
+                "Run: python _download_pose_model.py"
+            )
 
         self._capture = None
         self._running = False
@@ -55,11 +99,8 @@ class MotionCapture:
         self._fps = 0.0
         self._mirror = True
 
-        # MediaPipe
-        self._mp_pose = mp.solutions.pose
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_drawing_styles = mp.solutions.drawing_styles
-        self._pose = None
+        self._landmarker = None
+        self._frame_count = 0
 
     @property
     def is_running(self) -> bool:
@@ -99,14 +140,18 @@ class MotionCapture:
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
-        self._pose = self._mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
+        # Create PoseLandmarker with VIDEO mode
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options_module.BaseOptions(
+                model_asset_path=str(_MODEL_FILE),
+            ),
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+        self._landmarker = vision.PoseLandmarker.create_from_options(options)
+        self._frame_count = 0
 
         self._stop_event.clear()
         self._running = True
@@ -125,9 +170,9 @@ class MotionCapture:
         if self._capture:
             self._capture.release()
             self._capture = None
-        if self._pose:
-            self._pose.close()
-            self._pose = None
+        if self._landmarker:
+            self._landmarker.close()
+            self._landmarker = None
         logger.info("Motion capture stopped")
 
     def get_latest(self) -> tuple[PILImage.Image | None, list | None, list | None]:
@@ -151,8 +196,8 @@ class MotionCapture:
             t0 = time.perf_counter()
 
             capture = self._capture
-            pose = self._pose
-            if capture is None or pose is None:
+            landmarker = self._landmarker
+            if capture is None or landmarker is None:
                 break
 
             ret, frame = capture.read()
@@ -166,24 +211,44 @@ class MotionCapture:
 
             # Convert BGR to RGB for MediaPipe
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb)
+
+            # Create MediaPipe Image and detect
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            self._frame_count += 1
+            timestamp_ms = int(self._frame_count * (1000 / 30))
+
+            try:
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            except Exception as e:
+                logger.debug(f"Pose detection error: {e}")
+                # Still show camera frame even if detection fails
+                pil_image = PILImage.fromarray(rgb)
+                with self._lock:
+                    self._frame = pil_image
+                    self._landmarks = None
+                    self._world_landmarks = None
+                continue
 
             landmarks = None
             world_landmarks = None
 
-            if results.pose_landmarks:
-                landmarks = list(results.pose_landmarks.landmark)
+            if result.pose_landmarks and len(result.pose_landmarks) > 0:
+                # Convert to compatible format
+                raw = result.pose_landmarks[0]
+                landmarks = [
+                    _LandmarkCompat(lm.x, lm.y, lm.z, lm.visibility if hasattr(lm, 'visibility') else 1.0)
+                    for lm in raw
+                ]
 
-                # Draw skeleton overlay on the frame
-                self._mp_drawing.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    self._mp_pose.POSE_CONNECTIONS,
-                    landmark_drawing_spec=self._mp_drawing_styles.get_default_pose_landmarks_style(),
-                )
+                # Draw skeleton overlay
+                self._draw_skeleton(frame, raw)
 
-            if results.pose_world_landmarks:
-                world_landmarks = list(results.pose_world_landmarks.landmark)
+            if result.pose_world_landmarks and len(result.pose_world_landmarks) > 0:
+                raw_w = result.pose_world_landmarks[0]
+                world_landmarks = [
+                    _LandmarkCompat(lm.x, lm.y, lm.z, lm.visibility if hasattr(lm, 'visibility') else 1.0)
+                    for lm in raw_w
+                ]
 
             # Convert annotated frame to PIL
             annotated_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -207,3 +272,19 @@ class MotionCapture:
             remaining = 1.0 / 30 - elapsed
             if remaining > 0:
                 self._stop_event.wait(timeout=remaining)
+
+    def _draw_skeleton(self, frame, landmarks):
+        """Draw pose skeleton on the BGR frame."""
+        h, w = frame.shape[:2]
+        for start, end in _POSE_CONNECTIONS:
+            if start >= len(landmarks) or end >= len(landmarks):
+                continue
+            lm1 = landmarks[start]
+            lm2 = landmarks[end]
+            x1, y1 = int(lm1.x * w), int(lm1.y * h)
+            x2, y2 = int(lm2.x * w), int(lm2.y * h)
+            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        for lm in landmarks:
+            x, y = int(lm.x * w), int(lm.y * h)
+            cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
