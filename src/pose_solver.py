@@ -342,11 +342,19 @@ def apply_rotations_to_skeleton(
         if src_name in bone_name_to_index:
             vrm_to_idx[vrm_name] = bone_name_to_index[src_name]
 
-    # Apply rotations
-    for vrm_name, quat in bone_rotations.items():
-        if vrm_name not in vrm_to_idx:
-            continue
-        idx = vrm_to_idx[vrm_name]
+    # Build set of directly-rotated bone indices for fast lookup
+    rotated_indices: set[int] = set()
+
+    # Sort rotations by bone index to ensure parent-before-child processing order
+    sorted_rotations = sorted(
+        ((vrm_name, quat, vrm_to_idx[vrm_name])
+         for vrm_name, quat in bone_rotations.items()
+         if vrm_name in vrm_to_idx),
+        key=lambda x: x[2],
+    )
+
+    # Apply rotations in bone hierarchy order
+    for vrm_name, quat, idx in sorted_rotations:
         rot_mat = _quat_to_mat4(quat)
 
         # Apply rotation to rest-pose local transform
@@ -361,19 +369,12 @@ def apply_rotations_to_skeleton(
             new_global[idx] = new_global[bone.parent_index] @ new_local
         else:
             new_global[idx] = new_local
+        rotated_indices.add(idx)
 
-    # Recompute children transforms
+    # Recompute children transforms (propagate parent changes to non-rotated children)
     for i in range(n):
         bone = bones[i]
-        if bone.parent_index >= 0:
-            vrm_name_for_bone = None
-            for src, vn in vrm_bone_mapping.items():
-                if bone_name_to_index.get(src) == i:
-                    vrm_name_for_bone = vn
-                    break
-
-            if vrm_name_for_bone not in bone_rotations:
-                # This bone wasn't directly rotated; recompute from parent
-                new_global[i] = new_global[bone.parent_index] @ bone.local_transform
+        if bone.parent_index >= 0 and i not in rotated_indices:
+            new_global[i] = new_global[bone.parent_index] @ bone.local_transform
 
     return new_global

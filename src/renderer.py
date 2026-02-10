@@ -307,7 +307,11 @@ class ModelRenderer:
         for i, bone in enumerate(bones):
             ibm = bone.offset_matrix.copy()
             if np.allclose(ibm, np.eye(4)):
-                ibm = np.linalg.inv(rest_global[i])
+                try:
+                    ibm = np.linalg.inv(rest_global[i])
+                except np.linalg.LinAlgError:
+                    logger.warning(f"Singular rest transform for bone '{bone.name}', using identity")
+                    ibm = np.eye(4, dtype=np.float32)
             self._rest_matrices[i] = ibm
 
         # Identity bone matrices (rest pose)
@@ -320,6 +324,8 @@ class ModelRenderer:
         all_positions = []
 
         for mesh_data in fbx_data.meshes:
+            if len(mesh_data.positions) == 0 or len(mesh_data.indices) == 0:
+                continue
             all_positions.append(mesh_data.positions)
 
             # Build VBO data: position(3) + normal(3) + texcoord(2) + joints(4) + weights(4)
@@ -343,8 +349,8 @@ class ModelRenderer:
             )
 
             # Material color
-            mat_idx = min(mesh_data.material_index, len(fbx_data.materials) - 1)
-            if mat_idx >= 0 and mat_idx < len(fbx_data.materials):
+            mat_idx = max(0, min(mesh_data.material_index, len(fbx_data.materials) - 1))
+            if mat_idx < len(fbx_data.materials):
                 color = fbx_data.materials[mat_idx].diffuse_color
             else:
                 color = (0.8, 0.8, 0.8, 1.0)

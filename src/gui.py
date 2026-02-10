@@ -404,12 +404,13 @@ class App:
                 self._log(traceback.format_exc())
                 self._set_progress(0, f"Error: {e}")
             finally:
-                self.root.after(0, lambda: (
-                    setattr(self, '_converting', False),
-                    self._convert_btn.configure(state="normal", text="Convert to VRM"),
-                ))
+                self.root.after(0, self._finish_conversion)
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_conversion(self):
+        self._converting = False
+        self._convert_btn.configure(state="normal", text="Convert to VRM")
 
     # ──────────────────── Preview ────────────────────
 
@@ -436,10 +437,11 @@ class App:
                 self.root.after(0, lambda: self._finish_preview_load(path, fbx_data, bone_mapping))
             except Exception as e:
                 logger.error(f"Failed to load model: {e}", exc_info=True)
-                self.root.after(0, lambda: (
-                    self._preview_info.configure(text=f"Error: {e}"),
-                    setattr(self, '_loading_model', False),
-                ))
+                err = str(e)
+                def _on_error():
+                    self._preview_info.configure(text=f"Error: {err}")
+                    self._loading_model = False
+                self.root.after(0, _on_error)
 
         threading.Thread(target=_do_load, daemon=True).start()
 
@@ -548,10 +550,11 @@ class App:
                 self.root.after(0, lambda: self._finish_mocap_load(path, fbx_data, bone_mapping))
             except Exception as e:
                 logger.error(f"Failed to load model for MoCap: {e}", exc_info=True)
-                self.root.after(0, lambda: (
-                    self._mocap_status.configure(text=f"Error: {e}"),
-                    setattr(self, '_loading_model', False),
-                ))
+                err = str(e)
+                def _on_error():
+                    self._mocap_status.configure(text=f"Error: {err}")
+                    self._loading_model = False
+                self.root.after(0, _on_error)
 
         threading.Thread(target=_do_load, daemon=True).start()
 
