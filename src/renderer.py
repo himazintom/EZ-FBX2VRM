@@ -182,8 +182,10 @@ class OrbitCamera:
 class RenderMesh:
     """GPU mesh data for rendering."""
 
-    def __init__(self, vao, index_count: int, base_color: tuple, texture=None):
+    def __init__(self, vao, vbo, ibo, index_count: int, base_color: tuple, texture=None):
         self.vao = vao
+        self.vbo = vbo  # prevent GC of GPU buffer
+        self.ibo = ibo  # prevent GC of GPU buffer
         self.index_count = index_count
         self.base_color = base_color
         self.texture = texture
@@ -219,6 +221,7 @@ class ModelRenderer:
         self._rest_global = None    # (N, 4, 4) rest-pose global transforms
         self._bbox_min = np.array([-1, -1, -1], dtype=np.float32)
         self._bbox_max = np.array([1, 1, 1], dtype=np.float32)
+        self._model_matrix = np.eye(4, dtype=np.float32)  # Z-up to Y-up correction
         self._has_model = False
         self._fbo_size = (0, 0)
 
@@ -294,7 +297,7 @@ class ModelRenderer:
                 f"{self.MAX_BONES}. Extra bones will be ignored in rendering."
             )
 
-        # Compute rest-pose global transforms and inverse bind matrices
+        # Compute rest-pose global transforms
         rest_global = np.zeros((self._bone_count, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
             if bone.parent_index < 0:
@@ -303,21 +306,21 @@ class ModelRenderer:
                 rest_global[i] = rest_global[bone.parent_index] @ bone.local_transform
 
         self._rest_global = rest_global.copy()
-        self._rest_matrices = np.zeros_like(rest_global)
-        for i, bone in enumerate(bones):
-            ibm = bone.offset_matrix.copy()
-            if np.allclose(ibm, np.eye(4)):
-                try:
-                    ibm = np.linalg.inv(rest_global[i])
-                except np.linalg.LinAlgError:
-                    logger.warning(f"Singular rest transform for bone '{bone.name}', using identity")
-                    ibm = np.eye(4, dtype=np.float32)
-            self._rest_matrices[i] = ibm
 
-        # Identity bone matrices (rest pose)
-        self._bone_matrices = np.array(
-            [rest_global[i] @ self._rest_matrices[i] for i in range(self._bone_count)],
-            dtype=np.float32,
+        # For rendering, use inv(rest_global) as inverse bind matrix
+        # (FBX offset matrices may include coord-system/unit-scale conversions
+        # that don't match the node hierarchy, causing broken skinning)
+        self._rest_matrices = np.zeros_like(rest_global)
+        for i in range(self._bone_count):
+            try:
+                self._rest_matrices[i] = np.linalg.inv(rest_global[i])
+            except np.linalg.LinAlgError:
+                logger.warning(f"Singular rest transform for bone '{bones[i].name}', using identity")
+                self._rest_matrices[i] = np.eye(4, dtype=np.float32)
+
+        # Rest-pose bone matrices = identity (global @ inv(global))
+        self._bone_matrices = np.tile(
+            np.eye(4, dtype=np.float32), (self._bone_count, 1, 1)
         )
 
         # Compute model bounding box
@@ -357,6 +360,8 @@ class ModelRenderer:
 
             self._meshes.append(RenderMesh(
                 vao=vao,
+                vbo=vbo,
+                ibo=ibo,
                 index_count=len(mesh_data.indices),
                 base_color=color,
             ))
@@ -368,6 +373,35 @@ class ModelRenderer:
         else:
             self._bbox_min = np.array([-1, -1, -1], dtype=np.float32)
             self._bbox_max = np.array([1, 1, 1], dtype=np.float32)
+
+        # Auto-detect Z-up models and apply rotation to Y-up
+        extents = self._bbox_max - self._bbox_min
+        if extents[2] > extents[1] * 1.5:
+            # Z extent is much larger than Y: model is Z-up, rotate -90° around X
+            logger.info("Detected Z-up model, applying rotation to Y-up for preview")
+            rot = np.eye(4, dtype=np.float32)
+            # -90° around X: (x,y,z) -> (x, z, -y)
+            rot[1, 1] = 0.0
+            rot[1, 2] = 1.0
+            rot[2, 1] = -1.0
+            rot[2, 2] = 0.0
+            self._model_matrix = rot
+            # Recompute bbox after rotation
+            corners = np.array([
+                [self._bbox_min[0], self._bbox_min[1], self._bbox_min[2]],
+                [self._bbox_max[0], self._bbox_min[1], self._bbox_min[2]],
+                [self._bbox_min[0], self._bbox_max[1], self._bbox_min[2]],
+                [self._bbox_max[0], self._bbox_max[1], self._bbox_min[2]],
+                [self._bbox_min[0], self._bbox_min[1], self._bbox_max[2]],
+                [self._bbox_max[0], self._bbox_min[1], self._bbox_max[2]],
+                [self._bbox_min[0], self._bbox_max[1], self._bbox_max[2]],
+                [self._bbox_max[0], self._bbox_max[1], self._bbox_max[2]],
+            ], dtype=np.float32)
+            rotated = (rot[:3, :3] @ corners.T).T
+            self._bbox_min = rotated.min(axis=0)
+            self._bbox_max = rotated.max(axis=0)
+        else:
+            self._model_matrix = np.eye(4, dtype=np.float32)
 
         self._has_model = True
 
@@ -404,6 +438,11 @@ class ModelRenderer:
         """Rest-pose global transforms (N, 4, 4). None if no model loaded."""
         return self._rest_global
 
+    @staticmethod
+    def _gl_bytes(mat: np.ndarray) -> bytes:
+        """Convert numpy matrix to OpenGL column-major bytes (transpose for GLSL)."""
+        return np.ascontiguousarray(mat.T, dtype='f4').tobytes()
+
     def render(self, width: int, height: int, camera: OrbitCamera) -> PILImage.Image:
         """Render the scene and return a PIL Image."""
         self._ensure_context()
@@ -418,27 +457,28 @@ class ModelRenderer:
         vp = proj @ view
 
         # Draw grid
-        self.grid_prog['u_vp'].write(vp.astype('f4').tobytes())
+        self.grid_prog['u_vp'].write(self._gl_bytes(vp))
         self._grid_vao.render(moderngl.LINES)
 
         if self._has_model:
-            model = np.eye(4, dtype=np.float32)
-            self.prog['u_model'].write(model.tobytes())
-            self.prog['u_view'].write(view.astype('f4').tobytes())
-            self.prog['u_projection'].write(proj.astype('f4').tobytes())
+            self.prog['u_model'].write(self._gl_bytes(self._model_matrix))
+            self.prog['u_view'].write(self._gl_bytes(view))
+            self.prog['u_projection'].write(self._gl_bytes(proj))
             self.prog['u_light_dir'].value = (0.5, 1.0, 0.8)
             self.prog['u_light_color'].value = (0.9, 0.88, 0.85)
             self.prog['u_ambient'].value = (0.25, 0.25, 0.3)
             self.prog['u_camera_pos'].write(camera.eye.astype('f4').tobytes())
             self.prog['u_use_texture'].value = 0
 
-            # Upload bone matrices
+            # Upload bone matrices (each mat4 needs transposing)
             if self._bone_count > 0 and self._bone_matrices is not None:
                 self.prog['u_use_skinning'].value = 1
-                for i in range(min(self._bone_count, self.MAX_BONES)):
-                    self.prog[f'u_bone_matrices[{i}]'].write(
-                        self._bone_matrices[i].astype('f4').tobytes()
-                    )
+                n = min(self._bone_count, self.MAX_BONES)
+                full = np.tile(np.eye(4, dtype='f4'), (self.MAX_BONES, 1, 1))
+                full[:n] = self._bone_matrices[:n]
+                # Transpose each 4x4 matrix for GLSL column-major layout
+                full_t = np.ascontiguousarray(full.transpose(0, 2, 1), dtype='f4')
+                self.prog['u_bone_matrices'].write(full_t.tobytes())
             else:
                 self.prog['u_use_skinning'].value = 0
 
@@ -457,10 +497,15 @@ class ModelRenderer:
         for mesh in self._meshes:
             if mesh.vao:
                 mesh.vao.release()
+            if mesh.vbo:
+                mesh.vbo.release()
+            if mesh.ibo:
+                mesh.ibo.release()
             if mesh.texture:
                 mesh.texture.release()
         self._meshes.clear()
         self._has_model = False
+        self._model_matrix = np.eye(4, dtype=np.float32)
         self._bone_count = 0
         self._bone_matrices = None
         self._rest_matrices = None
