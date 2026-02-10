@@ -56,6 +56,7 @@ class App:
 
         self._converting = False
         self._loading_model = False  # Guard against concurrent model loading
+        self._loaded_fbx_path = None  # Path of the currently loaded FBX
 
         # Shared model data
         self._fbx_data = None
@@ -83,17 +84,24 @@ class App:
     # ──────────────────── UI Construction ────────────────────
 
     def _build_ui(self):
-        # Title bar
+        # Header with title and shared Load FBX button
         header = ctk.CTkFrame(self.root, height=50, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(8, 0))
         ctk.CTkLabel(
             header, text="EZ-FBX2VRM",
             font=ctk.CTkFont(size=22, weight="bold"),
         ).pack(side="left", padx=8)
-        ctk.CTkLabel(
-            header, text="FBX to VRM Converter + Motion Capture",
-            font=ctk.CTkFont(size=12), text_color="gray",
-        ).pack(side="left", padx=8)
+
+        ctk.CTkButton(
+            header, text="Load FBX", width=100,
+            command=self._load_model,
+        ).pack(side="left", padx=(16, 4))
+
+        self._global_model_label = ctk.CTkLabel(
+            header, text="No model loaded", text_color="gray",
+            font=ctk.CTkFont(size=11),
+        )
+        self._global_model_label.pack(side="left", padx=8)
 
         # Tabs
         self._tabview = ctk.CTkTabview(self.root, anchor="nw")
@@ -122,9 +130,8 @@ class App:
             anchor="w", padx=8, pady=(8, 2))
         input_row = ctk.CTkFrame(file_frame, fg_color="transparent")
         input_row.pack(fill="x", padx=8, pady=2)
-        self._input_entry = ctk.CTkEntry(input_row, placeholder_text="Select FBX file...")
+        self._input_entry = ctk.CTkEntry(input_row, placeholder_text="Use 'Load FBX' button above")
         self._input_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        ctk.CTkButton(input_row, text="Browse", width=80, command=self._browse_input).pack(side="right")
 
         ctk.CTkLabel(file_frame, text="Output VRM:", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(8, 2))
@@ -179,8 +186,6 @@ class App:
         toolbar = ctk.CTkFrame(tab, height=40, fg_color="transparent")
         toolbar.pack(fill="x", padx=4, pady=4)
 
-        ctk.CTkButton(toolbar, text="Load FBX", width=100, command=self._preview_load_model).pack(
-            side="left", padx=4)
         ctk.CTkButton(toolbar, text="Reset View", width=100, command=self._preview_reset_view).pack(
             side="left", padx=4)
 
@@ -222,9 +227,6 @@ class App:
         ctrl = ctk.CTkFrame(tab, height=45, fg_color="transparent")
         ctrl.pack(fill="x", padx=4, pady=4)
 
-        ctk.CTkButton(ctrl, text="Load FBX", width=100, command=self._mocap_load_model).pack(
-            side="left", padx=4)
-
         self._mocap_start_btn = ctk.CTkButton(
             ctrl, text="Start Camera", width=120,
             fg_color="#28a745", hover_color="#218838",
@@ -245,7 +247,7 @@ class App:
                                              font=ctk.CTkFont(size=11))
         self._mocap_fps_label.pack(side="right", padx=8)
 
-        self._mocap_status = ctk.CTkLabel(ctrl, text="Camera off", text_color="gray",
+        self._mocap_status = ctk.CTkLabel(ctrl, text="No model loaded", text_color="gray",
                                           font=ctk.CTkFont(size=11))
         self._mocap_status.pack(side="right", padx=8)
 
@@ -291,19 +293,6 @@ class App:
         combo.pack(side="left", padx=4)
         return combo
 
-    def _browse_input(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="Select FBX File",
-            filetypes=[("FBX files", "*.fbx"), ("All files", "*.*")],
-        )
-        if path:
-            self._input_entry.delete(0, "end")
-            self._input_entry.insert(0, path)
-            if not self._output_entry.get():
-                self._output_entry.delete(0, "end")
-                self._output_entry.insert(0, str(Path(path).with_suffix('.vrm')))
-
     def _browse_output(self):
         from tkinter import filedialog
         path = filedialog.asksaveasfilename(
@@ -341,31 +330,94 @@ class App:
             "commercialUsage": self._meta_commercial.get(),
         }
 
-    def _load_fbx_data(self, filepath: str):
-        """Load FBX data (CPU work, safe to call from background thread)."""
-        from .fbx_loader import load_fbx
-        from .bone_mapping import build_bone_mapping
+    # ──────────────────── Shared Model Loading ────────────────────
 
-        fbx_data = load_fbx(filepath)
-        bone_names = [b.name for b in fbx_data.bones]
-        bone_mapping = build_bone_mapping(bone_names)
-        return fbx_data, bone_mapping
+    def _load_model(self):
+        """Open file dialog and load FBX model for all tabs."""
+        if self._loading_model:
+            return
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select FBX File",
+            filetypes=[("FBX files", "*.fbx"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._load_model_from_path(path)
 
-    def _setup_renderer(self, fbx_data, bone_mapping):
-        """Set up renderer with loaded data (must be called on main thread for OpenGL)."""
-        from .renderer import ModelRenderer, OrbitCamera
+    def _load_model_from_path(self, path: str):
+        """Load FBX from a given path for all tabs."""
+        if self._loading_model:
+            return
+        self._loading_model = True
+        self._global_model_label.configure(text="Loading...", text_color="orange")
+        self.root.update_idletasks()
 
-        self._fbx_data = fbx_data
-        self._bone_mapping = bone_mapping
+        def _do_load():
+            try:
+                from .fbx_loader import load_fbx
+                from .bone_mapping import build_bone_mapping
 
-        if self._renderer is None:
-            self._renderer = ModelRenderer()
-        self._renderer.load_model(self._fbx_data)
+                fbx_data = load_fbx(path)
+                bone_names = [b.name for b in fbx_data.bones]
+                bone_mapping = build_bone_mapping(bone_names)
+                self.root.after(0, lambda: self._finish_model_load(path, fbx_data, bone_mapping))
+            except Exception as e:
+                logger.error(f"Failed to load model: {e}", exc_info=True)
+                err = str(e)
+                def _on_error():
+                    self._global_model_label.configure(text=f"Error: {err}", text_color="red")
+                    self._loading_model = False
+                self.root.after(0, _on_error)
 
-        if self._camera is None:
-            self._camera = OrbitCamera()
-        bbox_min, bbox_max = self._renderer.get_bbox()
-        self._camera.fit_to_bounds(bbox_min, bbox_max)
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _finish_model_load(self, path, fbx_data, bone_mapping):
+        """Finish loading on main thread - update all tabs."""
+        try:
+            from .renderer import ModelRenderer, OrbitCamera
+
+            self._fbx_data = fbx_data
+            self._bone_mapping = bone_mapping
+            self._loaded_fbx_path = path
+
+            if self._renderer is None:
+                self._renderer = ModelRenderer()
+            self._renderer.load_model(self._fbx_data)
+
+            if self._camera is None:
+                self._camera = OrbitCamera()
+            bbox_min, bbox_max = self._renderer.get_bbox()
+            self._camera.fit_to_bounds(bbox_min, bbox_max)
+
+            # Build model info string
+            n_meshes = len(fbx_data.meshes)
+            n_bones = len(fbx_data.bones)
+            n_verts = sum(len(m.positions) for m in fbx_data.meshes)
+            fname = Path(path).name
+            info = f"{fname} | {n_meshes} mesh, {n_bones} bones, {n_verts} verts"
+
+            # Update header
+            self._global_model_label.configure(text=info, text_color="white")
+
+            # Update Convert tab
+            self._input_entry.delete(0, "end")
+            self._input_entry.insert(0, path)
+            self._output_entry.delete(0, "end")
+            self._output_entry.insert(0, str(Path(path).with_suffix('.vrm')))
+
+            # Update Preview tab
+            self._preview_info.configure(text=info)
+            self._start_preview_loop()
+
+            # Update MoCap tab
+            self._mocap_status.configure(text=f"Model loaded: {fname}")
+
+        except Exception as e:
+            logger.error(f"Failed to set up renderer: {e}", exc_info=True)
+            self._global_model_label.configure(text=f"Error: {e}", text_color="red")
+        finally:
+            self._loading_model = False
 
     # ──────────────────── Convert ────────────────────
 
@@ -374,7 +426,7 @@ class App:
             return
         input_path = self._input_entry.get().strip()
         if not input_path:
-            self._log("ERROR: No input file selected.")
+            self._log("ERROR: No input file selected. Use 'Load FBX' button first.")
             return
         output_path = self._output_entry.get().strip()
         if not output_path:
@@ -413,53 +465,6 @@ class App:
         self._convert_btn.configure(state="normal", text="Convert to VRM")
 
     # ──────────────────── Preview ────────────────────
-
-    def _preview_load_model(self):
-        if self._loading_model:
-            return
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="Select FBX File",
-            filetypes=[("FBX files", "*.fbx"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-
-        self._loading_model = True
-        self._preview_info.configure(text="Loading...")
-        self.root.update_idletasks()
-
-        def _do_load():
-            try:
-                # CPU work in background thread
-                fbx_data, bone_mapping = self._load_fbx_data(path)
-                # Schedule GPU work on main thread
-                self.root.after(0, lambda: self._finish_preview_load(path, fbx_data, bone_mapping))
-            except Exception as e:
-                logger.error(f"Failed to load model: {e}", exc_info=True)
-                err = str(e)
-                def _on_error():
-                    self._preview_info.configure(text=f"Error: {err}")
-                    self._loading_model = False
-                self.root.after(0, _on_error)
-
-        threading.Thread(target=_do_load, daemon=True).start()
-
-    def _finish_preview_load(self, path, fbx_data, bone_mapping):
-        """Finish loading on main thread (OpenGL operations)."""
-        try:
-            self._setup_renderer(fbx_data, bone_mapping)
-            n_meshes = len(self._fbx_data.meshes)
-            n_bones = len(self._fbx_data.bones)
-            n_verts = sum(len(m.positions) for m in self._fbx_data.meshes)
-            self._preview_info.configure(
-                text=f"{Path(path).name} | {n_meshes} mesh, {n_bones} bones, {n_verts} verts")
-            self._start_preview_loop()
-        except Exception as e:
-            logger.error(f"Failed to set up renderer: {e}", exc_info=True)
-            self._preview_info.configure(text=f"Error: {e}")
-        finally:
-            self._loading_model = False
 
     def _preview_reset_view(self):
         if self._camera and self._renderer and self._renderer.has_model:
@@ -529,45 +534,6 @@ class App:
             self._camera.scroll_zoom(direction)
 
     # ──────────────────── MoCap ────────────────────
-
-    def _mocap_load_model(self):
-        if self._loading_model:
-            return
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="Select FBX File",
-            filetypes=[("FBX files", "*.fbx"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        self._loading_model = True
-        self._mocap_status.configure(text="Loading model...")
-        self.root.update_idletasks()
-
-        def _do_load():
-            try:
-                fbx_data, bone_mapping = self._load_fbx_data(path)
-                self.root.after(0, lambda: self._finish_mocap_load(path, fbx_data, bone_mapping))
-            except Exception as e:
-                logger.error(f"Failed to load model for MoCap: {e}", exc_info=True)
-                err = str(e)
-                def _on_error():
-                    self._mocap_status.configure(text=f"Error: {err}")
-                    self._loading_model = False
-                self.root.after(0, _on_error)
-
-        threading.Thread(target=_do_load, daemon=True).start()
-
-    def _finish_mocap_load(self, path, fbx_data, bone_mapping):
-        """Finish MoCap model loading on main thread (OpenGL operations)."""
-        try:
-            self._setup_renderer(fbx_data, bone_mapping)
-            self._mocap_status.configure(text=f"Model loaded: {Path(path).name}")
-        except Exception as e:
-            logger.error(f"Failed to set up renderer: {e}", exc_info=True)
-            self._mocap_status.configure(text=f"Error: {e}")
-        finally:
-            self._loading_model = False
 
     def _mocap_toggle(self):
         if self._mocap_running:
