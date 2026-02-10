@@ -5,6 +5,7 @@ Extracts mesh data, skeleton hierarchy, skinning weights, and materials
 from FBX files exported by Mixamo.
 """
 
+import ctypes
 import logging
 from dataclasses import dataclass, field
 
@@ -65,6 +66,7 @@ class FBXData:
     bones: list[BoneInfo]
     bone_name_to_index: dict[str, int]
     materials: list[MaterialData]
+    embedded_textures: dict[str, bytes] = field(default_factory=dict)  # "*0" -> raw bytes
 
 
 def _build_node_map(node, parent_name=None, result=None):
@@ -146,27 +148,45 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
                     bone.offsetmatrix, dtype=np.float32
                 ).T  # transpose from row-major
 
-        # Build ordered bone list by walking the node hierarchy
+        # Build ordered bone list by walking the node hierarchy.
+        # Collapse $AssimpFbx$ intermediate nodes (Translation/PreRotation/Rotation)
+        # by folding their transforms into the next real bone node.
         bone_list: list[BoneInfo] = []
         bone_name_to_idx: dict[str, int] = {}
 
-        # Find all nodes that are bones (referenced by mesh skinning)
-        # Also include their ancestors up to root to preserve hierarchy
-        all_bone_nodes = set(bone_name_set)
+        # Determine which nodes are "real" (actual bones or RootNode)
+        # vs intermediate ($AssimpFbx$ helper nodes created by Assimp)
+        def _is_intermediate(name):
+            return '$AssimpFbx$' in name
+
+        # Find all real nodes that should be in the skeleton:
+        # actual bone nodes + their non-intermediate ancestors
+        real_bone_nodes = set(bone_name_set)
         for bname in bone_name_set:
             parent = node_map.get(bname, {}).get("parent")
             while parent and parent in node_map:
-                all_bone_nodes.add(parent)
+                if not _is_intermediate(parent):
+                    real_bone_nodes.add(parent)
                 parent = node_map[parent].get("parent")
 
-        # Walk the tree in depth-first order to build bone list
-        def _walk_bones(node_name, parent_idx=-1):
+        def _walk_bones(node_name, parent_idx=-1, accumulated_transform=None):
             if node_name not in node_map:
                 return
             info = node_map[node_name]
+            local_xform = info["transform"]
 
-            # Only add nodes that are bones or ancestors of bones
-            if node_name not in all_bone_nodes:
+            # Accumulate transform through intermediate nodes
+            if accumulated_transform is not None:
+                local_xform = accumulated_transform @ local_xform
+
+            if _is_intermediate(node_name):
+                # Skip this node, pass accumulated transform to children
+                for child_name in info.get("children", []):
+                    _walk_bones(child_name, parent_idx, local_xform)
+                return
+
+            # Not in skeleton? Skip but recurse children (no accumulation)
+            if node_name not in real_bone_nodes:
                 return
 
             idx = len(bone_list)
@@ -175,13 +195,12 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
             offset = bone_offset_matrices.get(
                 node_name, np.eye(4, dtype=np.float32)
             )
-            local_transform = info["transform"]
 
             bone = BoneInfo(
                 name=node_name,
                 parent_index=parent_idx,
                 offset_matrix=offset,
-                local_transform=local_transform,
+                local_transform=local_xform,
             )
             bone_list.append(bone)
 
@@ -310,6 +329,25 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
                 material_index=mesh.materialindex,
             ))
 
+        # --- Extract embedded textures ---
+        embedded_textures: dict[str, bytes] = {}
+        for ti in range(len(scene.textures)):
+            tex_ptr = scene.textures[ti]
+            t = tex_ptr.contents if hasattr(tex_ptr, 'contents') else tex_ptr
+            # Compressed textures: mHeight==0, mWidth==byte_count
+            if t.mHeight == 0 and t.mWidth > 0:
+                try:
+                    data_ptr = t.pcData
+                    if data_ptr:
+                        byte_ptr = ctypes.cast(
+                            data_ptr, ctypes.POINTER(ctypes.c_ubyte * t.mWidth)
+                        )
+                        raw = bytes(byte_ptr.contents)
+                        embedded_textures[f"*{ti}"] = raw
+                        logger.info(f"Extracted embedded texture *{ti}: {len(raw)} bytes")
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedded texture *{ti}: {e}")
+
         _progress("FBX loading complete.", 1.0)
 
         return FBXData(
@@ -317,4 +355,5 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
             bones=bone_list,
             bone_name_to_index=bone_name_to_idx,
             materials=materials,
+            embedded_textures=embedded_textures,
         )
