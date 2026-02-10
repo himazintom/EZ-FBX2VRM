@@ -60,25 +60,15 @@ logger = logging.getLogger(__name__)
 # VRM 0.x coordinate system uses right-handed Y-up with -Z forward (same as glTF)
 # FBX models may use Z-up; detect and convert automatically.
 
-# Z-up to Y-up rotation: -90° around X axis
-# (x, y, z) -> (x, z, -y)
+# Z-up to Y-up rotation: cyclic axis permutation
+# Maps mesh-local space to scene-root space (rotation only, matching the
+# axis swap in the FBX mesh node's transform).
+# (x, y, z) -> (y, z, x)  — Z (height) becomes Y, preserving all bone axes.
 _Z_UP_TO_Y_UP = np.array([
-    [1,  0,  0,  0],
-    [0,  0,  1,  0],
-    [0, -1,  0,  0],
-    [0,  0,  0,  1],
-], dtype=np.float32)
-
-# Bone coordinate fix: +90° around Y axis
-# Mesh vertices (local space) and bone transforms (scene root) use different
-# lateral axes due to the mesh node's axis-swap transform baked by Assimp.
-# This rotation aligns bone X/Z with the mesh's rotated X/Z.
-# (x, y, z) -> (z, y, -x)
-_BONE_AXIS_FIX = np.array([
-    [ 0, 0, 1, 0],
-    [ 0, 1, 0, 0],
-    [-1, 0, 0, 0],
-    [ 0, 0, 0, 1],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [1, 0, 0, 0],
+    [0, 0, 0, 1],
 ], dtype=np.float32)
 
 
@@ -226,10 +216,6 @@ class VRMBuilder:
             node = Node(name=bone.name)
 
             local_xform = bone.local_transform
-            # For root bones, apply axis alignment so bones match the
-            # Z_UP_TO_Y_UP-rotated mesh coordinate system
-            if self._coord_fix is not None and bone.parent_index < 0:
-                local_xform = _BONE_AXIS_FIX @ local_xform
 
             # Decompose local transform into TRS
             t, r, s = _decompose_matrix(local_xform)
@@ -461,15 +447,13 @@ class VRMBuilder:
 
         # Compute global transforms from the node hierarchy (local transforms)
         # to ensure consistency with the glTF node tree.
-        # Root bones get the same axis fix applied in _build_skeleton.
+        # No bone rotation needed — the mesh coord fix aligns mesh vertices
+        # to the bone coordinate system directly.
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
-            local = bone.local_transform
-            if bone.parent_index < 0 and self._coord_fix is not None:
-                local = _BONE_AXIS_FIX @ local
             if bone.parent_index < 0:
-                global_xforms[i] = local
+                global_xforms[i] = bone.local_transform
             else:
                 global_xforms[i] = global_xforms[bone.parent_index] @ bone.local_transform
 
