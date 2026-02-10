@@ -58,7 +58,27 @@ from .bone_mapping import (
 logger = logging.getLogger(__name__)
 
 # VRM 0.x coordinate system uses right-handed Y-up with -Z forward (same as glTF)
-# FBX default is right-handed Y-up too, but may have different scale or axis
+# FBX models may use Z-up; detect and convert automatically.
+
+# Z-up to Y-up rotation: -90° around X axis
+# (x, y, z) -> (x, z, -y)
+_Z_UP_TO_Y_UP = np.array([
+    [1,  0,  0,  0],
+    [0,  0,  1,  0],
+    [0, -1,  0,  0],
+    [0,  0,  0,  1],
+], dtype=np.float32)
+
+
+def _detect_z_up(fbx_data: 'FBXData') -> bool:
+    """Return True if model appears to be Z-up (Z extent >> Y extent)."""
+    for mesh in fbx_data.meshes:
+        if len(mesh.positions) == 0:
+            continue
+        extents = mesh.positions.max(axis=0) - mesh.positions.min(axis=0)
+        if extents[2] > extents[1] * 1.5:
+            return True
+    return False
 
 
 class VRMBuilder:
@@ -70,6 +90,7 @@ class VRMBuilder:
         self.fbx = fbx_data
         self.fbx_dir = str(Path(fbx_path).parent) if fbx_path else ""
         self.gltf = GLTF2()
+        self._coord_fix = None  # set during build if Z-up detected
         self.gltf.asset = Asset(version="2.0", generator="EZ-FBX2VRM")
         self.gltf.scene = 0
 
@@ -105,6 +126,13 @@ class VRMBuilder:
             logger.info(msg)
             if callback:
                 callback(msg, pct)
+
+        # Auto-detect Z-up and prepare coordinate fix
+        if _detect_z_up(self.fbx):
+            logger.info("Detected Z-up model, will convert to Y-up for VRM output")
+            self._coord_fix = _Z_UP_TO_Y_UP
+        else:
+            self._coord_fix = None
 
         _progress("Building skeleton nodes...", 0.0)
         self._build_skeleton()
@@ -185,8 +213,13 @@ class VRMBuilder:
         for bi, bone in enumerate(bones):
             node = Node(name=bone.name)
 
+            # For root bones in Z-up models, prepend coordinate conversion
+            local_xform = bone.local_transform
+            if self._coord_fix is not None and bone.parent_index < 0:
+                local_xform = self._coord_fix @ local_xform
+
             # Decompose local transform into TRS
-            t, r, s = _decompose_matrix(bone.local_transform)
+            t, r, s = _decompose_matrix(local_xform)
             node.translation = t.tolist()
             node.rotation = r.tolist()  # [x, y, z, w]
             node.scale = s.tolist()
@@ -310,18 +343,26 @@ class VRMBuilder:
                 logger.warning(f"Skipping empty mesh: {mesh_data.name}")
                 continue
 
+            # Apply coordinate conversion if needed (Z-up -> Y-up)
+            positions = mesh_data.positions.astype(np.float32)
+            normals = mesh_data.normals.astype(np.float32)
+            if self._coord_fix is not None:
+                rot3 = self._coord_fix[:3, :3]
+                positions = np.ascontiguousarray((rot3 @ positions.T).T)
+                normals = np.ascontiguousarray((rot3 @ normals.T).T)
+
             # Position accessor
-            pos_data = mesh_data.positions.astype(np.float32).tobytes()
+            pos_data = positions.tobytes()
             pos_bv = self._add_buffer_view(pos_data, target=ARRAY_BUFFER)
-            pos_min = mesh_data.positions.min(axis=0).tolist()
-            pos_max = mesh_data.positions.max(axis=0).tolist()
+            pos_min = positions.min(axis=0).tolist()
+            pos_max = positions.max(axis=0).tolist()
             pos_acc = self._add_accessor(
-                pos_bv, GLTF_FLOAT, len(mesh_data.positions), VEC3,
+                pos_bv, GLTF_FLOAT, len(positions), VEC3,
                 min_vals=pos_min, max_vals=pos_max
             )
 
             # Normal accessor
-            norm_data = mesh_data.normals.astype(np.float32).tobytes()
+            norm_data = normals.tobytes()
             norm_bv = self._add_buffer_view(norm_data, target=ARRAY_BUFFER)
             norm_acc = self._add_accessor(
                 norm_bv, GLTF_FLOAT, len(mesh_data.normals), VEC3
@@ -395,23 +436,34 @@ class VRMBuilder:
         bones = self.fbx.bones
         joint_nodes = [self._bone_to_node[i] for i in range(len(bones))]
 
-        # Inverse bind matrices
+        # Compute global transforms from the node hierarchy (local transforms)
+        # to ensure consistency with the glTF node tree.
+        # Root bones include the Z-up->Y-up rotation if applicable.
+        n = len(bones)
+        global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
+        for i, bone in enumerate(bones):
+            local = bone.local_transform
+            if bone.parent_index < 0 and self._coord_fix is not None:
+                local = self._coord_fix @ local
+            if bone.parent_index < 0:
+                global_xforms[i] = local
+            else:
+                global_xforms[i] = global_xforms[bone.parent_index] @ bone.local_transform
+
+        # Inverse bind matrices = inv(global_transform) for each bone
         ibm_list = []
-        for bi, bone in enumerate(bones):
-            # The inverse bind matrix transforms from model space to bone space
-            ibm = bone.offset_matrix.copy()
-            # If no offset was provided (identity), compute from global transform
-            if np.allclose(ibm, np.eye(4)):
-                try:
-                    ibm = np.linalg.inv(bone.global_transform)
-                except np.linalg.LinAlgError:
-                    logger.warning(f"Singular global transform for bone '{bone.name}', using identity")
-                    ibm = np.eye(4, dtype=np.float32)
+        for i, bone in enumerate(bones):
+            try:
+                ibm = np.linalg.inv(global_xforms[i])
+            except np.linalg.LinAlgError:
+                logger.warning(f"Singular global transform for bone '{bone.name}', using identity")
+                ibm = np.eye(4, dtype=np.float32)
             ibm_list.append(ibm)
 
         ibm_array = np.array(ibm_list, dtype=np.float32)
-        # glTF expects column-major layout for mat4 (pygltflib handles this)
-        ibm_data = ibm_array.tobytes()
+        # glTF expects column-major layout for mat4: transpose each matrix
+        ibm_col_major = np.ascontiguousarray(ibm_array.transpose(0, 2, 1), dtype=np.float32)
+        ibm_data = ibm_col_major.tobytes()
         ibm_bv = self._add_buffer_view(ibm_data)
         ibm_acc = self._add_accessor(
             ibm_bv, GLTF_FLOAT, len(bones), MAT4
