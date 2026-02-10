@@ -74,7 +74,7 @@ def _build_node_map(node, parent_name=None, result=None):
     if result is None:
         result = {}
     name = node.name
-    transform = np.array(node.transformation, dtype=np.float32).T  # assimp is row-major
+    transform = np.array(node.transformation, dtype=np.float32)  # pyassimp already column-major
     result[name] = {
         "parent": parent_name,
         "transform": transform,
@@ -83,6 +83,56 @@ def _build_node_map(node, parent_name=None, result=None):
     for child in node.children:
         _build_node_map(child, name, result)
     return result
+
+
+def _fix_bone_unit_scale(scene, bone_list, log):
+    """Detect and fix unit scale mismatch between mesh vertices and bone transforms.
+
+    Assimp bakes parent-node transforms (including unit scaling) into mesh
+    vertex positions, but the node/bone transforms stay in the original FBX
+    units.  This detects the discrepancy by comparing mesh and bone extents
+    and applies a uniform scale correction to bone translations.
+    """
+    if not bone_list:
+        return
+
+    # Compute mesh extent along each axis
+    all_pos = []
+    for mesh in scene.meshes:
+        verts = np.array(mesh.vertices, dtype=np.float32).reshape(-1, 3)
+        all_pos.append(verts)
+    if not all_pos:
+        return
+    all_pos = np.concatenate(all_pos, axis=0)
+    mesh_extent = all_pos.max(axis=0) - all_pos.min(axis=0)
+    mesh_height = float(mesh_extent.max())
+
+    if mesh_height < 1e-6:
+        return
+
+    # Compute bone extent from global transforms
+    bone_positions = np.array([b.global_transform[:3, 3] for b in bone_list])
+    bone_extent = bone_positions.max(axis=0) - bone_positions.min(axis=0)
+    bone_height = float(bone_extent.max())
+
+    if bone_height < 1e-6:
+        return
+
+    ratio = bone_height / mesh_height
+    if ratio < 2.0:
+        # No significant mismatch
+        return
+
+    # Compute scale factor to bring bones into mesh space
+    scale_factor = mesh_height / bone_height
+    log.info(
+        f"Unit scale mismatch detected: mesh height={mesh_height:.4f}, "
+        f"bone height={bone_height:.4f}, applying scale={scale_factor:.6f}"
+    )
+
+    # Scale translation components of every bone's local_transform
+    for bone in bone_list:
+        bone.local_transform[:3, 3] *= scale_factor
 
 
 def load_fbx(filepath: str, callback=None) -> FBXData:
@@ -146,7 +196,7 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
                 # offset_matrix: transforms from mesh space to bone space
                 bone_offset_matrices[bone.name] = np.array(
                     bone.offsetmatrix, dtype=np.float32
-                ).T  # transpose from row-major
+                )  # pyassimp already column-major
 
         # Build ordered bone list by walking the node hierarchy.
         # Collapse $AssimpFbx$ intermediate nodes (Translation/PreRotation/Rotation)
@@ -213,6 +263,21 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
         _walk_bones(scene.rootnode.name, -1)
 
         # Compute global transforms
+        for bone in bone_list:
+            if bone.parent_index < 0:
+                bone.global_transform = bone.local_transform.copy()
+            else:
+                parent = bone_list[bone.parent_index]
+                bone.global_transform = parent.global_transform @ bone.local_transform
+
+        # --- Detect and fix unit scale mismatch ---
+        # Assimp bakes mesh-node transforms (which may include scale) into
+        # vertex positions, but bone transforms stay in original FBX units.
+        # Detect this by comparing mesh extents to bone extents.
+        _progress("Checking unit scale...", 0.35)
+        _fix_bone_unit_scale(scene, bone_list, logger)
+
+        # Recompute global transforms after scale fix
         for bone in bone_list:
             if bone.parent_index < 0:
                 bone.global_transform = bone.local_transform.copy()
