@@ -116,7 +116,7 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
     )
 
     try:
-        scene = pyassimp.load(filepath, processing=flags)
+        scene_ctx = pyassimp.load(filepath, processing=flags)
     except OSError as e:
         err_msg = str(e).lower()
         if "assimp" in err_msg or "dll" in err_msg or "shared" in err_msg or "library" in err_msg:
@@ -129,7 +129,7 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
     except Exception as e:
         raise RuntimeError(f"Failed to load FBX file: {filepath}\n{e}") from e
 
-    try:
+    with scene_ctx as scene:
         _progress("Building node hierarchy...", 0.1)
         node_map = _build_node_map(scene.rootnode)
 
@@ -318,5 +318,3 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
             bone_name_to_index=bone_name_to_idx,
             materials=materials,
         )
-    finally:
-        pyassimp.release(scene)
