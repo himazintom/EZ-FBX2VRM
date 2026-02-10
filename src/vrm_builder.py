@@ -296,21 +296,28 @@ class VRMBuilder:
         """Load a texture file and add it to the glTF. Returns texture index or None."""
         from PIL import Image as PILImage
 
-        # Normalize path separators (Windows backslashes -> forward slashes)
-        tex_path = tex_path.replace("\\", "/")
-
-        full_path = Path(self.fbx_dir) / tex_path if self.fbx_dir else Path(tex_path)
-        if not full_path.exists():
-            # Try just the filename
-            full_path = Path(self.fbx_dir) / Path(tex_path).name
-            if not full_path.exists():
-                logger.warning(f"Texture not found: {tex_path}")
-                return None
-
         try:
-            img = PILImage.open(str(full_path))
-            img = img.convert("RGBA")
+            # Handle embedded textures (Assimp uses "*0", "*1", etc.)
+            if tex_path.startswith('*') and tex_path[1:].isdigit():
+                raw_data = self.fbx.embedded_textures.get(tex_path)
+                if raw_data is None:
+                    logger.warning(f"Embedded texture {tex_path} not found in FBX data")
+                    return None
+                img = PILImage.open(io.BytesIO(raw_data))
+                tex_name = f"embedded_{tex_path[1:]}"
+            else:
+                # External texture file
+                tex_path = tex_path.replace("\\", "/")
+                full_path = Path(self.fbx_dir) / tex_path if self.fbx_dir else Path(tex_path)
+                if not full_path.exists():
+                    full_path = Path(self.fbx_dir) / Path(tex_path).name
+                    if not full_path.exists():
+                        logger.warning(f"Texture not found: {tex_path}")
+                        return None
+                img = PILImage.open(str(full_path))
+                tex_name = full_path.stem
 
+            img = img.convert("RGBA")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             png_data = buf.getvalue()
@@ -320,7 +327,7 @@ class VRMBuilder:
             gltf_image = Image(
                 bufferView=bv_idx,
                 mimeType="image/png",
-                name=full_path.stem,
+                name=tex_name,
             )
             self.gltf.images.append(gltf_image)
             img_idx = self._image_count
@@ -331,6 +338,7 @@ class VRMBuilder:
             tex_idx = self._texture_count
             self._texture_count += 1
 
+            logger.info(f"Loaded texture: {tex_path} ({img.size[0]}x{img.size[1]})")
             return tex_idx
         except Exception as e:
             logger.warning(f"Failed to load texture {tex_path}: {e}")
