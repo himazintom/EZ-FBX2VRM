@@ -44,6 +44,7 @@ class MotionCapture:
 
         self._capture = None
         self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
 
@@ -107,6 +108,7 @@ class MotionCapture:
             min_tracking_confidence=0.5,
         )
 
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -115,9 +117,11 @@ class MotionCapture:
     def stop(self):
         """Stop capturing."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
             self._thread = None
+        # Only release resources after thread has fully stopped
         if self._capture:
             self._capture.release()
             self._capture = None
@@ -143,12 +147,18 @@ class MotionCapture:
         """Main capture loop running in a background thread."""
         frame_times = []
 
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             t0 = time.perf_counter()
 
-            ret, frame = self._capture.read()
+            capture = self._capture
+            pose = self._pose
+            if capture is None or pose is None:
+                break
+
+            ret, frame = capture.read()
             if not ret:
-                time.sleep(0.01)
+                if self._stop_event.wait(timeout=0.01):
+                    break
                 continue
 
             if self._mirror:
@@ -156,7 +166,7 @@ class MotionCapture:
 
             # Convert BGR to RGB for MediaPipe
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self._pose.process(rgb)
+            results = pose.process(rgb)
 
             landmarks = None
             world_landmarks = None
@@ -194,5 +204,6 @@ class MotionCapture:
 
             # Cap at ~30fps to save CPU
             elapsed = t1 - t0
-            if elapsed < 1.0 / 30:
-                time.sleep(1.0 / 30 - elapsed)
+            remaining = 1.0 / 30 - elapsed
+            if remaining > 0:
+                self._stop_event.wait(timeout=remaining)

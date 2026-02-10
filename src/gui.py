@@ -55,6 +55,7 @@ class App:
         self.root.minsize(800, 650)
 
         self._converting = False
+        self._loading_model = False  # Guard against concurrent model loading
 
         # Shared model data
         self._fbx_data = None
@@ -340,13 +341,22 @@ class App:
             "commercialUsage": self._meta_commercial.get(),
         }
 
-    def _load_fbx_file(self, filepath: str):
-        """Load FBX and prepare renderer + bone mapping."""
+    def _load_fbx_data(self, filepath: str):
+        """Load FBX data (CPU work, safe to call from background thread)."""
         from .fbx_loader import load_fbx
-        from .renderer import ModelRenderer, OrbitCamera
         from .bone_mapping import build_bone_mapping
 
-        self._fbx_data = load_fbx(filepath)
+        fbx_data = load_fbx(filepath)
+        bone_names = [b.name for b in fbx_data.bones]
+        bone_mapping = build_bone_mapping(bone_names)
+        return fbx_data, bone_mapping
+
+    def _setup_renderer(self, fbx_data, bone_mapping):
+        """Set up renderer with loaded data (must be called on main thread for OpenGL)."""
+        from .renderer import ModelRenderer, OrbitCamera
+
+        self._fbx_data = fbx_data
+        self._bone_mapping = bone_mapping
 
         if self._renderer is None:
             self._renderer = ModelRenderer()
@@ -356,9 +366,6 @@ class App:
             self._camera = OrbitCamera()
         bbox_min, bbox_max = self._renderer.get_bbox()
         self._camera.fit_to_bounds(bbox_min, bbox_max)
-
-        bone_names = [b.name for b in self._fbx_data.bones]
-        self._bone_mapping = build_bone_mapping(bone_names)
 
     # ──────────────────── Convert ────────────────────
 
@@ -407,6 +414,8 @@ class App:
     # ──────────────────── Preview ────────────────────
 
     def _preview_load_model(self):
+        if self._loading_model:
+            return
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title="Select FBX File",
@@ -415,24 +424,40 @@ class App:
         if not path:
             return
 
+        self._loading_model = True
         self._preview_info.configure(text="Loading...")
         self.root.update_idletasks()
 
-        def _do():
+        def _do_load():
             try:
-                self._load_fbx_file(path)
-                n_meshes = len(self._fbx_data.meshes)
-                n_bones = len(self._fbx_data.bones)
-                n_verts = sum(len(m.positions) for m in self._fbx_data.meshes)
-                self.root.after(0, lambda: self._preview_info.configure(
-                    text=f"{Path(path).name} | {n_meshes} mesh, {n_bones} bones, {n_verts} verts"))
-                self._start_preview_loop()
+                # CPU work in background thread
+                fbx_data, bone_mapping = self._load_fbx_data(path)
+                # Schedule GPU work on main thread
+                self.root.after(0, lambda: self._finish_preview_load(path, fbx_data, bone_mapping))
             except Exception as e:
                 logger.error(f"Failed to load model: {e}", exc_info=True)
-                self.root.after(0, lambda: self._preview_info.configure(
-                    text=f"Error: {e}"))
+                self.root.after(0, lambda: (
+                    self._preview_info.configure(text=f"Error: {e}"),
+                    setattr(self, '_loading_model', False),
+                ))
 
-        threading.Thread(target=_do, daemon=True).start()
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _finish_preview_load(self, path, fbx_data, bone_mapping):
+        """Finish loading on main thread (OpenGL operations)."""
+        try:
+            self._setup_renderer(fbx_data, bone_mapping)
+            n_meshes = len(self._fbx_data.meshes)
+            n_bones = len(self._fbx_data.bones)
+            n_verts = sum(len(m.positions) for m in self._fbx_data.meshes)
+            self._preview_info.configure(
+                text=f"{Path(path).name} | {n_meshes} mesh, {n_bones} bones, {n_verts} verts")
+            self._start_preview_loop()
+        except Exception as e:
+            logger.error(f"Failed to set up renderer: {e}", exc_info=True)
+            self._preview_info.configure(text=f"Error: {e}")
+        finally:
+            self._loading_model = False
 
     def _preview_reset_view(self):
         if self._camera and self._renderer and self._renderer.has_model:
@@ -504,6 +529,8 @@ class App:
     # ──────────────────── MoCap ────────────────────
 
     def _mocap_load_model(self):
+        if self._loading_model:
+            return
         from tkinter import filedialog
         path = filedialog.askopenfilename(
             title="Select FBX File",
@@ -511,19 +538,33 @@ class App:
         )
         if not path:
             return
+        self._loading_model = True
         self._mocap_status.configure(text="Loading model...")
         self.root.update_idletasks()
 
-        def _do():
+        def _do_load():
             try:
-                self._load_fbx_file(path)
-                self.root.after(0, lambda: self._mocap_status.configure(
-                    text=f"Model loaded: {Path(path).name}"))
+                fbx_data, bone_mapping = self._load_fbx_data(path)
+                self.root.after(0, lambda: self._finish_mocap_load(path, fbx_data, bone_mapping))
             except Exception as e:
                 logger.error(f"Failed to load model for MoCap: {e}", exc_info=True)
-                self.root.after(0, lambda: self._mocap_status.configure(text=f"Error: {e}"))
+                self.root.after(0, lambda: (
+                    self._mocap_status.configure(text=f"Error: {e}"),
+                    setattr(self, '_loading_model', False),
+                ))
 
-        threading.Thread(target=_do, daemon=True).start()
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _finish_mocap_load(self, path, fbx_data, bone_mapping):
+        """Finish MoCap model loading on main thread (OpenGL operations)."""
+        try:
+            self._setup_renderer(fbx_data, bone_mapping)
+            self._mocap_status.configure(text=f"Model loaded: {Path(path).name}")
+        except Exception as e:
+            logger.error(f"Failed to set up renderer: {e}", exc_info=True)
+            self._mocap_status.configure(text=f"Error: {e}")
+        finally:
+            self._loading_model = False
 
     def _mocap_toggle(self):
         if self._mocap_running:
@@ -610,7 +651,9 @@ class App:
 
             # Solve pose and update model
             use_landmarks = world_landmarks if world_landmarks else landmarks
-            if use_landmarks and self._pose_solver and self._fbx_data and self._bone_mapping:
+            if (use_landmarks and self._pose_solver and self._fbx_data
+                    and self._bone_mapping and self._renderer
+                    and self._renderer.rest_global is not None):
                 from .pose_solver import apply_rotations_to_skeleton
 
                 rotations = self._pose_solver.solve(use_landmarks)
@@ -620,7 +663,7 @@ class App:
                         self._fbx_data.bones,
                         self._fbx_data.bone_name_to_index,
                         self._bone_mapping,
-                        self._renderer._rest_global,
+                        self._renderer.rest_global,
                     )
                     self._renderer.set_bone_transforms(new_global)
 

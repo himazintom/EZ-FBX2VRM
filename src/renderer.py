@@ -199,6 +199,8 @@ class ModelRenderer:
         image = renderer.render(800, 600, camera)
     """
 
+    MAX_BONES = 128  # Must match shader u_bone_matrices array size
+
     def __init__(self):
         if moderngl is None:
             raise ImportError("moderngl is required: pip install moderngl")
@@ -207,11 +209,16 @@ class ModelRenderer:
         self.prog = None
         self.grid_prog = None
         self.fbo = None
+        self._fbo_color = None
+        self._fbo_depth = None
         self._meshes: list[RenderMesh] = []
         self._grid_vao = None
         self._bone_count = 0
         self._bone_matrices = None  # (N, 4, 4) current bone transforms
         self._rest_matrices = None  # (N, 4, 4) rest pose inverse bind
+        self._rest_global = None    # (N, 4, 4) rest-pose global transforms
+        self._bbox_min = np.array([-1, -1, -1], dtype=np.float32)
+        self._bbox_max = np.array([1, 1, 1], dtype=np.float32)
         self._has_model = False
         self._fbo_size = (0, 0)
 
@@ -232,11 +239,18 @@ class ModelRenderer:
 
     def _ensure_fbo(self, width: int, height: int):
         if self._fbo_size != (width, height):
+            # Release old FBO and its attachments to avoid GPU memory leak
+            if self._fbo_color:
+                self._fbo_color.release()
+            if self._fbo_depth:
+                self._fbo_depth.release()
             if self.fbo:
                 self.fbo.release()
-            color = self.ctx.texture((width, height), 4)
-            depth = self.ctx.depth_renderbuffer((width, height))
-            self.fbo = self.ctx.framebuffer(color_attachments=[color], depth_attachment=depth)
+            self._fbo_color = self.ctx.texture((width, height), 4)
+            self._fbo_depth = self.ctx.depth_renderbuffer((width, height))
+            self.fbo = self.ctx.framebuffer(
+                color_attachments=[self._fbo_color], depth_attachment=self._fbo_depth
+            )
             self._fbo_size = (width, height)
 
     def _build_grid(self):
@@ -274,6 +288,11 @@ class ModelRenderer:
 
         bones = fbx_data.bones
         self._bone_count = len(bones)
+        if self._bone_count > self.MAX_BONES:
+            logger.warning(
+                f"Model has {self._bone_count} bones, exceeding shader limit of "
+                f"{self.MAX_BONES}. Extra bones will be ignored in rendering."
+            )
 
         # Compute rest-pose global transforms and inverse bind matrices
         rest_global = np.zeros((self._bone_count, 4, 4), dtype=np.float32)
@@ -374,6 +393,11 @@ class ModelRenderer:
     def bone_count(self) -> int:
         return self._bone_count
 
+    @property
+    def rest_global(self) -> np.ndarray | None:
+        """Rest-pose global transforms (N, 4, 4). None if no model loaded."""
+        return self._rest_global
+
     def render(self, width: int, height: int, camera: OrbitCamera) -> PILImage.Image:
         """Render the scene and return a PIL Image."""
         self._ensure_context()
@@ -405,7 +429,7 @@ class ModelRenderer:
             # Upload bone matrices
             if self._bone_count > 0 and self._bone_matrices is not None:
                 self.prog['u_use_skinning'].value = 1
-                for i in range(min(self._bone_count, 128)):
+                for i in range(min(self._bone_count, self.MAX_BONES)):
                     self.prog[f'u_bone_matrices[{i}]'].write(
                         self._bone_matrices[i].astype('f4').tobytes()
                     )
@@ -423,15 +447,36 @@ class ModelRenderer:
         return img
 
     def _cleanup_model(self):
+        # Release GPU resources (VAOs hold references to VBOs/IBOs)
+        for mesh in self._meshes:
+            if mesh.vao:
+                mesh.vao.release()
+            if mesh.texture:
+                mesh.texture.release()
         self._meshes.clear()
         self._has_model = False
         self._bone_count = 0
         self._bone_matrices = None
         self._rest_matrices = None
         self._rest_global = None
+        self._bbox_min = np.array([-1, -1, -1], dtype=np.float32)
+        self._bbox_max = np.array([1, 1, 1], dtype=np.float32)
 
     def cleanup(self):
         self._cleanup_model()
+        if self._grid_vao:
+            self._grid_vao.release()
+            self._grid_vao = None
+        if self._fbo_color:
+            self._fbo_color.release()
+            self._fbo_color = None
+        if self._fbo_depth:
+            self._fbo_depth.release()
+            self._fbo_depth = None
+        if self.fbo:
+            self.fbo.release()
+            self.fbo = None
+        self._fbo_size = (0, 0)
         if self.ctx:
             self.ctx.release()
             self.ctx = None
@@ -442,9 +487,24 @@ class ModelRenderer:
 def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     """Compute a view matrix (look-at)."""
     f = target - eye
-    f = f / np.linalg.norm(f)
+    f_len = np.linalg.norm(f)
+    if f_len < 1e-8:
+        # Eye is at target; return identity view
+        return np.eye(4, dtype=np.float32)
+    f = f / f_len
+
     s = np.cross(f, up)
-    s = s / np.linalg.norm(s)
+    s_len = np.linalg.norm(s)
+    if s_len < 1e-8:
+        # Forward is parallel to up; choose a fallback up vector
+        fallback_up = np.array([1, 0, 0], dtype=np.float32)
+        s = np.cross(f, fallback_up)
+        s_len = np.linalg.norm(s)
+        if s_len < 1e-8:
+            fallback_up = np.array([0, 0, 1], dtype=np.float32)
+            s = np.cross(f, fallback_up)
+            s_len = np.linalg.norm(s)
+    s = s / s_len
     u = np.cross(s, f)
 
     m = np.eye(4, dtype=np.float32)

@@ -12,36 +12,40 @@ import struct
 from pathlib import Path
 
 import numpy as np
-from pygltflib import (
-    GLTF2,
-    Accessor,
-    Asset,
-    Attributes,
-    Buffer,
-    BufferView,
-    Image,
-    Material,
-    Mesh,
-    Node,
-    Primitive,
-    Scene,
-    Skin,
-    Texture,
-    TextureInfo,
-)
-from pygltflib import (
-    FLOAT as GLTF_FLOAT,
-    UNSIGNED_INT as GLTF_UINT,
-    UNSIGNED_SHORT as GLTF_USHORT,
-    UNSIGNED_BYTE as GLTF_UBYTE,
-    SCALAR,
-    VEC2,
-    VEC3,
-    VEC4,
-    MAT4,
-    ARRAY_BUFFER,
-    ELEMENT_ARRAY_BUFFER,
-)
+
+try:
+    from pygltflib import (
+        GLTF2,
+        Accessor,
+        Asset,
+        Attributes,
+        Buffer,
+        BufferView,
+        Image,
+        Material,
+        Mesh,
+        Node,
+        Primitive,
+        Scene,
+        Skin,
+        Texture,
+        TextureInfo,
+    )
+    from pygltflib import (
+        FLOAT as GLTF_FLOAT,
+        UNSIGNED_INT as GLTF_UINT,
+        UNSIGNED_SHORT as GLTF_USHORT,
+        UNSIGNED_BYTE as GLTF_UBYTE,
+        SCALAR,
+        VEC2,
+        VEC3,
+        VEC4,
+        MAT4,
+        ARRAY_BUFFER,
+        ELEMENT_ARRAY_BUFFER,
+    )
+except ImportError:
+    GLTF2 = None
 
 from .fbx_loader import FBXData, MeshData, BoneInfo
 from .bone_mapping import (
@@ -61,6 +65,8 @@ class VRMBuilder:
     """Builds a VRM 0.x file from FBX data."""
 
     def __init__(self, fbx_data: FBXData, fbx_path: str = ""):
+        if GLTF2 is None:
+            raise ImportError("pygltflib is required: pip install pygltflib")
         self.fbx = fbx_data
         self.fbx_dir = str(Path(fbx_path).parent) if fbx_path else ""
         self.gltf = GLTF2()
@@ -254,6 +260,9 @@ class VRMBuilder:
         """Load a texture file and add it to the glTF. Returns texture index or None."""
         from PIL import Image as PILImage
 
+        # Normalize path separators (Windows backslashes -> forward slashes)
+        tex_path = tex_path.replace("\\", "/")
+
         full_path = Path(self.fbx_dir) / tex_path if self.fbx_dir else Path(tex_path)
         if not full_path.exists():
             # Try just the filename
@@ -294,6 +303,10 @@ class VRMBuilder:
     def _build_meshes(self):
         """Create glTF meshes with skinning attributes."""
         for mesh_data in self.fbx.meshes:
+            if len(mesh_data.positions) == 0 or len(mesh_data.indices) == 0:
+                logger.warning(f"Skipping empty mesh: {mesh_data.name}")
+                continue
+
             # Position accessor
             pos_data = mesh_data.positions.astype(np.float32).tobytes()
             pos_bv = self._add_buffer_view(pos_data, target=ARRAY_BUFFER)
@@ -419,7 +432,7 @@ class VRMBuilder:
 
         # Add root bone node(s)
         for bi, bone in enumerate(self.fbx.bones):
-            if bone.parent_index < 0:
+            if bone.parent_index < 0 and bi in self._bone_to_node:
                 root_nodes.append(self._bone_to_node[bi])
 
         # Add mesh nodes
@@ -597,13 +610,17 @@ def _decompose_matrix(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarr
     sx = np.linalg.norm(mat[:3, 0])
     sy = np.linalg.norm(mat[:3, 1])
     sz = np.linalg.norm(mat[:3, 2])
+    # Clamp scales to avoid zero-division; treat near-zero scale as 1.0
+    sx = sx if sx > 1e-6 else 1.0
+    sy = sy if sy > 1e-6 else 1.0
+    sz = sz if sz > 1e-6 else 1.0
     scale = np.array([sx, sy, sz], dtype=np.float32)
 
     # Extract rotation matrix (remove scale)
     rot_mat = np.zeros((3, 3), dtype=np.float64)
-    rot_mat[:, 0] = mat[:3, 0] / sx if sx > 1e-6 else mat[:3, 0]
-    rot_mat[:, 1] = mat[:3, 1] / sy if sy > 1e-6 else mat[:3, 1]
-    rot_mat[:, 2] = mat[:3, 2] / sz if sz > 1e-6 else mat[:3, 2]
+    rot_mat[:, 0] = mat[:3, 0] / sx
+    rot_mat[:, 1] = mat[:3, 1] / sy
+    rot_mat[:, 2] = mat[:3, 2] / sz
 
     # Convert rotation matrix to quaternion (xyzw)
     quat = _mat3_to_quaternion(rot_mat)

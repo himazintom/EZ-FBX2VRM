@@ -115,7 +115,19 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
         | pp.aiProcess_FlipUVs
     )
 
-    scene = pyassimp.load(filepath, processing=flags)
+    try:
+        scene = pyassimp.load(filepath, processing=flags)
+    except OSError as e:
+        err_msg = str(e).lower()
+        if "assimp" in err_msg or "dll" in err_msg or "shared" in err_msg or "library" in err_msg:
+            raise RuntimeError(
+                "Assimp shared library not found. On Windows, install the Assimp DLL "
+                "or run: pip install pyassimp and ensure assimp.dll is on your PATH.\n"
+                f"Original error: {e}"
+            ) from e
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Failed to load FBX file: {filepath}\n{e}") from e
 
     try:
         _progress("Building node hierarchy...", 0.1)

@@ -114,15 +114,21 @@ def _slerp(q1: np.ndarray, q2: np.ndarray, t: float) -> np.ndarray:
     if dot < 0:
         q2 = -q2
         dot = -dot
+    # Clamp to valid acos domain to prevent math domain errors from float imprecision
+    dot = min(max(dot, 0.0), 1.0)
     if dot > 0.9995:
         result = q1 + t * (q2 - q1)
-        return result / np.linalg.norm(result)
-    theta = math.acos(min(dot, 1.0))
+        n = np.linalg.norm(result)
+        return result / n if n > 1e-10 else q1.copy()
+    theta = math.acos(dot)
     sin_theta = math.sin(theta)
+    if sin_theta < 1e-10:
+        return q1.copy()
     a = math.sin((1 - t) * theta) / sin_theta
     b = math.sin(t * theta) / sin_theta
     result = a * q1 + b * q2
-    return result / np.linalg.norm(result)
+    n = np.linalg.norm(result)
+    return result / n if n > 1e-10 else q1.copy()
 
 
 # T-pose reference directions (Y-up, right-handed)
