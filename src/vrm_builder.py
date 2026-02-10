@@ -213,6 +213,9 @@ class VRMBuilder:
             logger.warning("The output VRM may not work correctly in all applications.")
 
         for bone_name, vrm_name in mapping.items():
+            if bone_name not in self.fbx.bone_name_to_index:
+                logger.warning(f"Bone '{bone_name}' in mapping but not in FBX data, skipping")
+                continue
             bi = self.fbx.bone_name_to_index[bone_name]
             node_idx = self._bone_to_node[bi]
             self._vrm_human_bones.append({
@@ -361,7 +364,7 @@ class VRMBuilder:
                 WEIGHTS_0=jw_acc,
             )
 
-            mat_idx = min(mesh_data.material_index, self._material_count - 1)
+            mat_idx = max(0, min(mesh_data.material_index, self._material_count - 1))
 
             primitive = Primitive(
                 attributes=attributes,
@@ -399,7 +402,11 @@ class VRMBuilder:
             ibm = bone.offset_matrix.copy()
             # If no offset was provided (identity), compute from global transform
             if np.allclose(ibm, np.eye(4)):
-                ibm = np.linalg.inv(bone.global_transform)
+                try:
+                    ibm = np.linalg.inv(bone.global_transform)
+                except np.linalg.LinAlgError:
+                    logger.warning(f"Singular global transform for bone '{bone.name}', using identity")
+                    ibm = np.eye(4, dtype=np.float32)
             ibm_list.append(ibm)
 
         ibm_array = np.array(ibm_list, dtype=np.float32)

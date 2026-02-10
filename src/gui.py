@@ -482,7 +482,7 @@ class App:
                 self._preview_canvas.configure(image=ctk_img, text="")
                 self._preview_canvas._ctk_image = ctk_img  # prevent GC
             except Exception as e:
-                logger.debug(f"Preview render error: {e}")
+                logger.warning(f"Preview render error: {e}")
 
         self._preview_after_id = self.root.after(FRAME_MS, self._preview_tick)
 
@@ -681,7 +681,7 @@ class App:
             self._mocap_fps_label.configure(text=f"FPS: {fps:.0f}")
 
         except Exception as e:
-            logger.debug(f"MoCap tick error: {e}")
+            logger.warning(f"MoCap tick error: {e}")
 
         self._mocap_after_id = self.root.after(FRAME_MS, self._mocap_tick)
 

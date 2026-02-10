@@ -259,6 +259,7 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
                     texcoords = tc[:, :2]
 
             if texcoords is None:
+                logger.debug(f"Mesh '{mesh.name or mi}' has no texture coordinates, using zeros")
                 texcoords = np.zeros((n_verts, 2), dtype=np.float32)
 
             # Indices
@@ -296,7 +297,7 @@ def load_fbx(filepath: str, callback=None) -> FBXData:
                     total = sum(e[1] for e in entries)
                     for j, (bidx, w) in enumerate(entries):
                         joint_indices[vid, j] = bidx
-                        joint_weights[vid, j] = w / total if total > 0 else 0
+                        joint_weights[vid, j] = w / total if total > 1e-8 else 0.0
 
             mesh_list.append(MeshData(
                 name=mesh.name if mesh.name else f"Mesh_{mi}",

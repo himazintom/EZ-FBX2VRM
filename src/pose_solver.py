@@ -160,6 +160,7 @@ class PoseSolver:
 
     def __init__(self):
         self.smoothing = 0.4  # 0 = no smoothing, 1 = full smoothing
+        self.min_visibility = 0.5  # Minimum visibility threshold for landmarks
         self._prev_rotations: dict[str, np.ndarray] = {}
 
     def solve(self, landmarks: list) -> dict[str, np.ndarray]:
@@ -175,6 +176,19 @@ class PoseSolver:
         """
         if not landmarks or len(landmarks) < 33:
             return {}
+
+        # Check visibility of key landmarks; skip frame if too many are low-confidence
+        key_indices = [
+            LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP,
+            LEFT_ELBOW, RIGHT_ELBOW, LEFT_KNEE, RIGHT_KNEE,
+        ]
+        visible_count = sum(
+            1 for i in key_indices
+            if hasattr(landmarks[i], 'visibility') and landmarks[i].visibility >= self.min_visibility
+        )
+        if visible_count < 4:
+            # Too few key landmarks visible; return previous rotations for stability
+            return dict(self._prev_rotations)
 
         # Convert landmarks to numpy array
         # MediaPipe uses: x=right, y=down, z=toward camera (screen coords)
