@@ -16,6 +16,8 @@ def convert_fbx_to_vrm(
     output_path: str,
     meta: dict | None = None,
     callback=None,
+    target_height: float | None = None,
+    flip_forward: bool = False,
 ) -> None:
     """
     Convert an FBX file to VRM format.
@@ -25,6 +27,8 @@ def convert_fbx_to_vrm(
         output_path: Path to the output VRM file.
         meta: Optional VRM metadata (title, author, license, etc.)
         callback: Optional progress callback(message: str, progress: float).
+        target_height: Target model height in meters (None = no scaling).
+        flip_forward: If True, rotate model 180° around Y for cluster compatibility.
     """
     def _progress(msg, pct):
         logger.info(msg)
@@ -56,7 +60,8 @@ def convert_fbx_to_vrm(
 
     # Phase 2: Build VRM
     _progress("Phase 2/3: Building VRM...", 0.4)
-    builder = VRMBuilder(fbx_data, fbx_path=str(input_file))
+    builder = VRMBuilder(fbx_data, fbx_path=str(input_file),
+                         target_height=target_height, flip_forward=flip_forward)
     vrm_data = builder.build(
         meta=meta,
         callback=lambda msg, p: _progress(f"  {msg}", 0.4 + p * 0.4),

@@ -141,6 +141,26 @@ class App:
         self._meta_sexual = self._add_combo(meta_frame, "Sexual Usage:", PERMISSION_OPTIONS, "Disallow")
         self._meta_commercial = self._add_combo(meta_frame, "Commercial:", PERMISSION_OPTIONS, "Disallow")
 
+        # Conversion options
+        opt_frame = ctk.CTkFrame(tab)
+        opt_frame.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(opt_frame, text="Conversion Options", font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=8, pady=(8, 4))
+
+        height_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        height_row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkLabel(height_row, text="Target Height:", width=110, anchor="w").pack(side="left")
+        self._height_entry = ctk.CTkEntry(height_row, width=80, placeholder_text="1.7")
+        self._height_entry.insert(0, "1.7")
+        self._height_entry.pack(side="left", padx=4)
+        ctk.CTkLabel(height_row, text="m", text_color="gray").pack(side="left")
+
+        cluster_row = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        cluster_row.pack(fill="x", padx=8, pady=(2, 8))
+        self._cluster_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(cluster_row, text="cluster mode (flip forward direction)",
+                        variable=self._cluster_var).pack(anchor="w")
+
         # Convert button
         self._convert_btn = ctk.CTkButton(
             tab, text="Convert to VRM", height=40,
@@ -363,11 +383,22 @@ class App:
         self._set_progress(0, "Starting...")
         meta = self._get_meta()
 
+        # Parse conversion options
+        target_height = None
+        try:
+            h = float(self._height_entry.get())
+            if h > 0:
+                target_height = h
+        except ValueError:
+            pass
+        flip_forward = self._cluster_var.get()
+
         def _run():
             try:
                 from .converter import convert_fbx_to_vrm
                 convert_fbx_to_vrm(
                     input_path, output_path, meta=meta,
+                    target_height=target_height, flip_forward=flip_forward,
                     callback=lambda msg, pct: (self._log(msg), self._set_progress(pct, msg)),
                 )
                 self._log(f"\nConversion successful!\nOutput: {output_path}")

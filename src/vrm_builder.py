@@ -71,6 +71,14 @@ _Z_UP_TO_Y_UP = np.array([
     [0, 0, 0, 1],
 ], dtype=np.float32)
 
+# 180-degree rotation around Y axis: flips forward direction (+Z <-> -Z)
+_FLIP_Y180 = np.array([
+    [-1, 0,  0, 0],
+    [ 0, 1,  0, 0],
+    [ 0, 0, -1, 0],
+    [ 0, 0,  0, 1],
+], dtype=np.float32)
+
 
 def _detect_z_up(fbx_data: 'FBXData') -> bool:
     """Return True if model appears to be Z-up (Z extent >> Y extent)."""
@@ -86,13 +94,17 @@ def _detect_z_up(fbx_data: 'FBXData') -> bool:
 class VRMBuilder:
     """Builds a VRM 0.x file from FBX data."""
 
-    def __init__(self, fbx_data: FBXData, fbx_path: str = ""):
+    def __init__(self, fbx_data: FBXData, fbx_path: str = "",
+                 target_height: float | None = None, flip_forward: bool = False):
         if GLTF2 is None:
             raise ImportError("pygltflib is required: pip install pygltflib")
         self.fbx = fbx_data
         self.fbx_dir = str(Path(fbx_path).parent) if fbx_path else ""
         self.gltf = GLTF2()
         self._coord_fix = None  # set during build if Z-up detected
+        self._flip_forward = flip_forward
+        self._target_height = target_height
+        self._height_scale = 1.0
         self.gltf.asset = Asset(version="2.0", generator="EZ-FBX2VRM")
         self.gltf.scene = 0
 
@@ -136,6 +148,16 @@ class VRMBuilder:
         else:
             self._coord_fix = None
 
+        if self._flip_forward:
+            logger.info("Flip forward enabled (180° Y rotation for cluster compatibility)")
+
+        # Compute height scale if target height specified
+        if self._target_height is not None:
+            current_h = self._compute_model_height()
+            if current_h > 0.01:
+                self._height_scale = self._target_height / current_h
+                logger.info(f"Height scaling: {current_h:.3f}m -> {self._target_height:.2f}m (x{self._height_scale:.4f})")
+
         _progress("Building skeleton nodes...", 0.0)
         self._build_skeleton()
 
@@ -159,6 +181,22 @@ class VRMBuilder:
 
         _progress("VRM build complete.", 1.0)
         return result
+
+    def _compute_model_height(self) -> float:
+        """Compute model height (Y extent) after coordinate conversion."""
+        all_pos = []
+        for mesh_data in self.fbx.meshes:
+            if len(mesh_data.positions) == 0:
+                continue
+            pos = mesh_data.positions.astype(np.float32)
+            if self._coord_fix is not None:
+                rot3 = self._coord_fix[:3, :3]
+                pos = (rot3 @ pos.T).T
+            all_pos.append(pos)
+        if not all_pos:
+            return 0.0
+        combined = np.concatenate(all_pos, axis=0)
+        return float(combined[:, 1].max() - combined[:, 1].min())
 
     def _add_buffer_view(self, data: bytes, target: int | None = None) -> int:
         """Add data to the buffer and create a BufferView. Returns view index."""
@@ -215,7 +253,15 @@ class VRMBuilder:
         for bi, bone in enumerate(bones):
             node = Node(name=bone.name)
 
-            local_xform = bone.local_transform
+            local_xform = bone.local_transform.copy()
+
+            # Apply 180° Y rotation to root bones for forward-direction flip
+            if self._flip_forward and bone.parent_index < 0:
+                local_xform = _FLIP_Y180 @ local_xform
+
+            # Scale bone translations for target height
+            if self._height_scale != 1.0:
+                local_xform[:3, 3] *= self._height_scale
 
             # Decompose local transform into TRS
             t, r, s = _decompose_matrix(local_xform)
@@ -360,6 +406,17 @@ class VRMBuilder:
                 positions = np.ascontiguousarray((rot3 @ positions.T).T)
                 normals = np.ascontiguousarray((rot3 @ normals.T).T)
 
+            # Apply 180° Y rotation for forward-direction flip
+            if self._flip_forward:
+                positions[:, 0] *= -1
+                positions[:, 2] *= -1
+                normals[:, 0] *= -1
+                normals[:, 2] *= -1
+
+            # Apply height scale
+            if self._height_scale != 1.0:
+                positions *= self._height_scale
+
             # Position accessor
             pos_data = positions.tobytes()
             pos_bv = self._add_buffer_view(pos_data, target=ARRAY_BUFFER)
@@ -447,15 +504,19 @@ class VRMBuilder:
 
         # Compute global transforms from the node hierarchy (local transforms)
         # to ensure consistency with the glTF node tree.
-        # No bone rotation needed — the mesh coord fix aligns mesh vertices
-        # to the bone coordinate system directly.
+        # Must apply the same flip/scale transforms as _build_skeleton().
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
+            local_xform = bone.local_transform.copy()
+            if self._flip_forward and bone.parent_index < 0:
+                local_xform = _FLIP_Y180 @ local_xform
+            if self._height_scale != 1.0:
+                local_xform[:3, 3] *= self._height_scale
             if bone.parent_index < 0:
-                global_xforms[i] = bone.local_transform
+                global_xforms[i] = local_xform
             else:
-                global_xforms[i] = global_xforms[bone.parent_index] @ bone.local_transform
+                global_xforms[i] = global_xforms[bone.parent_index] @ local_xform
 
         # Inverse bind matrices = inv(global_transform) for each bone
         ibm_list = []
