@@ -85,49 +85,44 @@ def _build_node_map(node, parent_name=None, result=None):
     return result
 
 
+def _find_mesh_node_scale(node):
+    """Walk the scene tree and return the scale factor of the first mesh node.
+
+    Returns the magnitude of the first column of the mesh node's transform,
+    which represents the uniform scale applied by Assimp's FBX importer to
+    mesh vertices.  Returns None if no scaled mesh node is found.
+    """
+    if hasattr(node, 'meshes') and len(node.meshes) > 0:
+        xform = np.array(node.transformation, dtype=np.float32)
+        scale = float(np.linalg.norm(xform[:3, 0]))
+        if scale > 1.5:  # Only return if significantly scaled
+            return scale
+    for child in node.children:
+        result = _find_mesh_node_scale(child)
+        if result is not None:
+            return result
+    return None
+
+
 def _fix_bone_unit_scale(scene, bone_list, log):
     """Detect and fix unit scale mismatch between mesh vertices and bone transforms.
 
-    Assimp bakes parent-node transforms (including unit scaling) into mesh
-    vertex positions, but the node/bone transforms stay in the original FBX
-    units.  This detects the discrepancy by comparing mesh and bone extents
-    and applies a uniform scale correction to bone translations.
+    Assimp bakes the mesh node's transform (including scale) into vertex
+    positions, but bone node transforms stay in the original FBX units.
+    Extract the exact scale factor from the mesh node's transform matrix
+    and apply its inverse to bone translations.
     """
     if not bone_list:
         return
 
-    # Compute mesh extent along each axis
-    all_pos = []
-    for mesh in scene.meshes:
-        verts = np.array(mesh.vertices, dtype=np.float32).reshape(-1, 3)
-        all_pos.append(verts)
-    if not all_pos:
-        return
-    all_pos = np.concatenate(all_pos, axis=0)
-    mesh_extent = all_pos.max(axis=0) - all_pos.min(axis=0)
-    mesh_height = float(mesh_extent.max())
-
-    if mesh_height < 1e-6:
+    mesh_node_scale = _find_mesh_node_scale(scene.rootnode)
+    if mesh_node_scale is None:
         return
 
-    # Compute bone extent from global transforms
-    bone_positions = np.array([b.global_transform[:3, 3] for b in bone_list])
-    bone_extent = bone_positions.max(axis=0) - bone_positions.min(axis=0)
-    bone_height = float(bone_extent.max())
-
-    if bone_height < 1e-6:
-        return
-
-    ratio = bone_height / mesh_height
-    if ratio < 2.0:
-        # No significant mismatch
-        return
-
-    # Compute scale factor to bring bones into mesh space
-    scale_factor = mesh_height / bone_height
+    scale_factor = 1.0 / mesh_node_scale
     log.info(
-        f"Unit scale mismatch detected: mesh height={mesh_height:.4f}, "
-        f"bone height={bone_height:.4f}, applying scale={scale_factor:.6f}"
+        f"Mesh node scale={mesh_node_scale:.4f}, "
+        f"applying bone scale={scale_factor:.6f}"
     )
 
     # Scale translation components of every bone's local_transform
