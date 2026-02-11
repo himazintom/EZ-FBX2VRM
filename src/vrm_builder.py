@@ -51,6 +51,7 @@ from .fbx_loader import FBXData, MeshData, BoneInfo
 from .bone_mapping import (
     build_bone_mapping,
     validate_bone_mapping,
+    swap_lr_bones,
     VRM_REQUIRED_BONES,
     VRM_OPTIONAL_BONES,
 )
@@ -286,6 +287,9 @@ class VRMBuilder:
         # Build VRM humanoid bone mapping
         bone_names = [b.name for b in bones]
         mapping = build_bone_mapping(bone_names)
+        # When flipping 180°, left/right swap physically — update VRM names to match
+        if self._flip_forward:
+            mapping = swap_lr_bones(mapping)
         is_valid, missing = validate_bone_mapping(mapping)
 
         if not is_valid:

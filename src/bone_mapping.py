@@ -152,6 +152,43 @@ def build_bone_mapping(bone_names: list[str]) -> dict[str, str]:
     return mapping
 
 
+# Left <-> Right swap for VRM bone names (used when model is flipped 180°)
+_LR_SWAP = {}
+for _l, _r in [
+    ("leftShoulder", "rightShoulder"),
+    ("leftUpperArm", "rightUpperArm"),
+    ("leftLowerArm", "rightLowerArm"),
+    ("leftHand", "rightHand"),
+    ("leftUpperLeg", "rightUpperLeg"),
+    ("leftLowerLeg", "rightLowerLeg"),
+    ("leftFoot", "rightFoot"),
+    ("leftToes", "rightToes"),
+    ("leftEye", "rightEye"),
+    ("leftThumbProximal", "rightThumbProximal"),
+    ("leftThumbIntermediate", "rightThumbIntermediate"),
+    ("leftThumbDistal", "rightThumbDistal"),
+    ("leftIndexProximal", "rightIndexProximal"),
+    ("leftIndexIntermediate", "rightIndexIntermediate"),
+    ("leftIndexDistal", "rightIndexDistal"),
+    ("leftMiddleProximal", "rightMiddleProximal"),
+    ("leftMiddleIntermediate", "rightMiddleIntermediate"),
+    ("leftMiddleDistal", "rightMiddleDistal"),
+    ("leftRingProximal", "rightRingProximal"),
+    ("leftRingIntermediate", "rightRingIntermediate"),
+    ("leftRingDistal", "rightRingDistal"),
+    ("leftLittleProximal", "rightLittleProximal"),
+    ("leftLittleIntermediate", "rightLittleIntermediate"),
+    ("leftLittleDistal", "rightLittleDistal"),
+]:
+    _LR_SWAP[_l] = _r
+    _LR_SWAP[_r] = _l
+
+
+def swap_lr_bones(mapping: dict[str, str]) -> dict[str, str]:
+    """Swap left/right VRM bone names in mapping (for 180° Y flip)."""
+    return {k: _LR_SWAP.get(v, v) for k, v in mapping.items()}
+
+
 def validate_bone_mapping(mapping: dict[str, str]) -> tuple[bool, list[str]]:
     """
     Validate that all required VRM bones are present in the mapping.
