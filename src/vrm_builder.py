@@ -51,7 +51,7 @@ from .fbx_loader import FBXData, MeshData, BoneInfo
 from .bone_mapping import (
     build_bone_mapping,
     validate_bone_mapping,
-    strip_mixamo_prefix,
+    swap_lr_bones,
     VRM_REQUIRED_BONES,
     VRM_OPTIONAL_BONES,
 )
@@ -260,6 +260,13 @@ class VRMBuilder:
             if self._height_scale != 1.0:
                 local_xform[:3, 3] *= self._height_scale
 
+            # For cluster flip: apply 180° Y rotation to ROOT bones only.
+            # This rotates the entire skeleton consistently (all child globals
+            # get the Ry180 prefix) while preserving non-root local transforms
+            # so that cluster's animation system works correctly.
+            if self._flip_forward and bone.parent_index < 0:
+                local_xform = _FLIP_Y180 @ local_xform
+
             # Decompose local transform into TRS
             t, r, s = _decompose_matrix(local_xform)
             node.translation = t.tolist()
@@ -281,6 +288,9 @@ class VRMBuilder:
         # Build VRM humanoid bone mapping
         bone_names = [b.name for b in bones]
         mapping = build_bone_mapping(bone_names)
+        # After root Ry180, left/right swap physically — update VRM names
+        if self._flip_forward:
+            mapping = swap_lr_bones(mapping)
         is_valid, missing = validate_bone_mapping(mapping)
 
         if not is_valid:
@@ -388,23 +398,6 @@ class VRMBuilder:
             logger.warning(f"Failed to load texture {tex_path}: {e}")
             return None
 
-    def _build_lr_bone_index_swap(self) -> dict[int, int]:
-        """Build mapping of left bone indices <-> right bone indices for flip mode."""
-        bones = self.fbx.bones
-        stripped_to_idx: dict[str, int] = {}
-        for bi, bone in enumerate(bones):
-            stripped_to_idx[strip_mixamo_prefix(bone.name)] = bi
-
-        swap: dict[int, int] = {}
-        for stripped, bi in stripped_to_idx.items():
-            if 'Left' in stripped and bi not in swap:
-                right_name = stripped.replace('Left', 'Right')
-                if right_name in stripped_to_idx:
-                    bj = stripped_to_idx[right_name]
-                    swap[bi] = bj
-                    swap[bj] = bi
-        return swap
-
     def _build_meshes(self):
         """Create glTF meshes with skinning attributes."""
         for mesh_data in self.fbx.meshes:
@@ -424,9 +417,8 @@ class VRMBuilder:
             if self._height_scale != 1.0:
                 positions *= self._height_scale
 
-            # Apply 180° Y flip for cluster: negate X and Z of mesh,
-            # swap L/R joint indices so vertices stay near their bones.
-            # Bone transforms are NOT modified — preserves animation compatibility.
+            # Apply 180° Y flip for cluster: negate X and Z of mesh
+            # to match the root bone Ry180 rotation.
             if self._flip_forward:
                 positions[:, 0] *= -1
                 positions[:, 2] *= -1
@@ -457,16 +449,8 @@ class VRMBuilder:
                 tc_bv, GLTF_FLOAT, len(mesh_data.texcoords), VEC2
             )
 
-            # Joint indices — swap L/R bone references when flipping
-            if self._flip_forward:
-                ji = mesh_data.joint_indices.copy()
-                lr_swap = self._build_lr_bone_index_swap()
-                for old_idx, new_idx in lr_swap.items():
-                    mask = mesh_data.joint_indices == old_idx
-                    ji[mask] = new_idx
-            else:
-                ji = mesh_data.joint_indices
-            ji_data = ji.astype(np.uint16).tobytes()
+            # Joint indices accessor (UNSIGNED_SHORT)
+            ji_data = mesh_data.joint_indices.astype(np.uint16).tobytes()
             ji_bv = self._add_buffer_view(ji_data, target=ARRAY_BUFFER)
             ji_acc = self._add_accessor(
                 ji_bv, GLTF_USHORT, len(mesh_data.joint_indices), VEC4
@@ -528,14 +512,15 @@ class VRMBuilder:
 
         # Compute global transforms from the node hierarchy (local transforms)
         # to ensure consistency with the glTF node tree.
-        # Must apply the same scale transform as _build_skeleton().
-        # Note: flip_forward does NOT modify bones — only mesh + joint indices.
+        # Must apply the same scale/flip transforms as _build_skeleton().
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
             local_xform = bone.local_transform.copy()
             if self._height_scale != 1.0:
                 local_xform[:3, 3] *= self._height_scale
+            if self._flip_forward and bone.parent_index < 0:
+                local_xform = _FLIP_Y180 @ local_xform
             if bone.parent_index < 0:
                 global_xforms[i] = local_xform
             else:
