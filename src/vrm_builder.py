@@ -255,10 +255,6 @@ class VRMBuilder:
 
             local_xform = bone.local_transform.copy()
 
-            # Apply 180° Y rotation to root bones for forward-direction flip
-            if self._flip_forward and bone.parent_index < 0:
-                local_xform = _FLIP_Y180 @ local_xform
-
             # Scale bone translations for target height
             if self._height_scale != 1.0:
                 local_xform[:3, 3] *= self._height_scale
@@ -406,13 +402,6 @@ class VRMBuilder:
                 positions = np.ascontiguousarray((rot3 @ positions.T).T)
                 normals = np.ascontiguousarray((rot3 @ normals.T).T)
 
-            # Apply 180° Y rotation for forward-direction flip
-            if self._flip_forward:
-                positions[:, 0] *= -1
-                positions[:, 2] *= -1
-                normals[:, 0] *= -1
-                normals[:, 2] *= -1
-
             # Apply height scale
             if self._height_scale != 1.0:
                 positions *= self._height_scale
@@ -504,13 +493,11 @@ class VRMBuilder:
 
         # Compute global transforms from the node hierarchy (local transforms)
         # to ensure consistency with the glTF node tree.
-        # Must apply the same flip/scale transforms as _build_skeleton().
+        # Must apply the same scale transform as _build_skeleton().
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
         for i, bone in enumerate(bones):
             local_xform = bone.local_transform.copy()
-            if self._flip_forward and bone.parent_index < 0:
-                local_xform = _FLIP_Y180 @ local_xform
             if self._height_scale != 1.0:
                 local_xform[:3, 3] *= self._height_scale
             if bone.parent_index < 0:
@@ -555,19 +542,35 @@ class VRMBuilder:
 
     def _build_scene(self):
         """Build the glTF scene with root nodes."""
-        root_nodes = []
-
-        # Add root bone node(s)
+        # Collect root bone nodes
+        bone_roots = []
         for bi, bone in enumerate(self.fbx.bones):
             if bone.parent_index < 0 and bi in self._bone_to_node:
-                root_nodes.append(self._bone_to_node[bi])
+                bone_roots.append(self._bone_to_node[bi])
 
-        # Add mesh nodes
+        # Collect mesh nodes
+        mesh_roots = []
         for i, node in enumerate(self.gltf.nodes):
             if node.mesh is not None:
-                root_nodes.append(i)
+                mesh_roots.append(i)
 
-        scene = Scene(name="Scene", nodes=root_nodes)
+        children = bone_roots + mesh_roots
+
+        if self._flip_forward:
+            # Wrap everything under a 180° Y rotation node.
+            # This rotates the entire model without changing bone
+            # orientations, so skinning and humanoid mapping stay correct.
+            wrapper = Node(name="FlipRoot")
+            wrapper.rotation = [0.0, 1.0, 0.0, 0.0]  # quat 180° Y
+            wrapper.children = children
+            self.gltf.nodes.append(wrapper)
+            wrapper_idx = self._node_count
+            self._node_count += 1
+            scene_roots = [wrapper_idx]
+        else:
+            scene_roots = children
+
+        scene = Scene(name="Scene", nodes=scene_roots)
         self.gltf.scenes.append(scene)
 
     def _build_vrm_extension(self, meta: dict):
