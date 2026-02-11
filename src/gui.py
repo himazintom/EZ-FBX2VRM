@@ -1,10 +1,9 @@
 """
 GUI for EZ-FBX2VRM using CustomTkinter.
 
-Three-tab interface:
+Two-tab interface:
   1. Convert  - FBX to VRM conversion
   2. Preview  - 3D model viewer with orbit camera
-  3. MoCap    - Webcam motion capture synced to 3D model
 """
 
 import logging
@@ -19,11 +18,6 @@ try:
     import customtkinter as ctk
 except ImportError:
     ctk = None
-
-try:
-    from PIL import Image as PILImage, ImageTk
-except ImportError:
-    PILImage = None
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +56,10 @@ class App:
         self._fbx_data = None
         self._renderer = None
         self._camera = None
-        self._mocap = None
-        self._pose_solver = None
-        self._bone_mapping = None
-
         # Preview state
         self._preview_running = False
         self._preview_image_label = None
         self._preview_after_id = None
-
-        # MoCap state
-        self._mocap_running = False
-        self._mocap_after_id = None
 
         # Mouse state
         self._mouse_last_x = 0
@@ -109,11 +95,9 @@ class App:
 
         self._tab_convert = self._tabview.add("Convert")
         self._tab_preview = self._tabview.add("Preview")
-        self._tab_mocap = self._tabview.add("MoCap")
 
         self._build_convert_tab()
         self._build_preview_tab()
-        self._build_mocap_tab()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -218,62 +202,6 @@ class App:
         self._preview_drag_button = None
         self._preview_shift = False
 
-    # ──── MoCap Tab ────
-
-    def _build_mocap_tab(self):
-        tab = self._tab_mocap
-
-        # Controls
-        ctrl = ctk.CTkFrame(tab, height=45, fg_color="transparent")
-        ctrl.pack(fill="x", padx=4, pady=4)
-
-        self._mocap_start_btn = ctk.CTkButton(
-            ctrl, text="Start Camera", width=120,
-            fg_color="#28a745", hover_color="#218838",
-            command=self._mocap_toggle,
-        )
-        self._mocap_start_btn.pack(side="left", padx=4)
-
-        ctk.CTkLabel(ctrl, text="Camera:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(12, 2))
-        self._cam_index_entry = ctk.CTkEntry(ctrl, width=40, placeholder_text="0")
-        self._cam_index_entry.insert(0, "0")
-        self._cam_index_entry.pack(side="left", padx=2)
-
-        self._mirror_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(ctrl, text="Mirror", variable=self._mirror_var, width=60,
-                        command=self._mocap_update_mirror).pack(side="left", padx=8)
-
-        self._mocap_fps_label = ctk.CTkLabel(ctrl, text="FPS: --", text_color="gray",
-                                             font=ctk.CTkFont(size=11))
-        self._mocap_fps_label.pack(side="right", padx=8)
-
-        self._mocap_status = ctk.CTkLabel(ctrl, text="No model loaded", text_color="gray",
-                                          font=ctk.CTkFont(size=11))
-        self._mocap_status.pack(side="right", padx=8)
-
-        # Split view: camera on left, 3D model on right
-        split = ctk.CTkFrame(tab, fg_color="transparent")
-        split.pack(fill="both", expand=True, padx=4, pady=4)
-        split.grid_columnconfigure(0, weight=1)
-        split.grid_columnconfigure(1, weight=1)
-        split.grid_rowconfigure(0, weight=1)
-
-        # Camera view
-        cam_frame = ctk.CTkFrame(split)
-        cam_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        ctk.CTkLabel(cam_frame, text="Camera", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="#aaa").pack(anchor="w", padx=4, pady=2)
-        self._mocap_cam_label = ctk.CTkLabel(cam_frame, text="")
-        self._mocap_cam_label.pack(fill="both", expand=True, padx=2, pady=2)
-
-        # Model view
-        model_frame = ctk.CTkFrame(split)
-        model_frame.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
-        ctk.CTkLabel(model_frame, text="Model", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="#aaa").pack(anchor="w", padx=4, pady=2)
-        self._mocap_model_label = ctk.CTkLabel(model_frame, text="")
-        self._mocap_model_label.pack(fill="both", expand=True, padx=2, pady=2)
-
     # ──────────────────── Helpers ────────────────────
 
     def _add_field(self, parent, label: str, default: str) -> ctk.CTkEntry:
@@ -356,12 +284,9 @@ class App:
         def _do_load():
             try:
                 from .fbx_loader import load_fbx
-                from .bone_mapping import build_bone_mapping
 
                 fbx_data = load_fbx(path)
-                bone_names = [b.name for b in fbx_data.bones]
-                bone_mapping = build_bone_mapping(bone_names)
-                self.root.after(0, lambda: self._finish_model_load(path, fbx_data, bone_mapping))
+                self.root.after(0, lambda: self._finish_model_load(path, fbx_data))
             except Exception as e:
                 logger.error(f"Failed to load model: {e}", exc_info=True)
                 err = str(e)
@@ -372,13 +297,12 @@ class App:
 
         threading.Thread(target=_do_load, daemon=True).start()
 
-    def _finish_model_load(self, path, fbx_data, bone_mapping):
+    def _finish_model_load(self, path, fbx_data):
         """Finish loading on main thread - update all tabs."""
         try:
             from .renderer import ModelRenderer, OrbitCamera
 
             self._fbx_data = fbx_data
-            self._bone_mapping = bone_mapping
             self._loaded_fbx_path = path
 
             if self._renderer is None:
@@ -409,9 +333,6 @@ class App:
             # Update Preview tab
             self._preview_info.configure(text=info)
             self._start_preview_loop()
-
-            # Update MoCap tab
-            self._mocap_status.configure(text=f"Model loaded: {fname}")
 
         except Exception as e:
             logger.error(f"Failed to set up renderer: {e}", exc_info=True)
@@ -533,138 +454,12 @@ class App:
         if self._camera:
             self._camera.scroll_zoom(direction)
 
-    # ──────────────────── MoCap ────────────────────
-
-    def _mocap_toggle(self):
-        if self._mocap_running:
-            self._mocap_stop()
-        else:
-            self._mocap_start()
-
-    def _mocap_start(self):
-        from .motion_capture import MotionCapture
-        from .pose_solver import PoseSolver
-
-        if not self._renderer or not self._renderer.has_model:
-            self._mocap_status.configure(text="Load a model first!")
-            return
-
-        cam_idx = 0
-        try:
-            cam_idx = int(self._cam_index_entry.get())
-        except ValueError:
-            pass
-
-        self._mocap_status.configure(text="Starting camera...")
-        self.root.update_idletasks()
-
-        try:
-            if self._mocap is None:
-                self._mocap = MotionCapture()
-            self._mocap.mirror = self._mirror_var.get()
-            self._mocap.start(camera_index=cam_idx)
-
-            if self._pose_solver is None:
-                self._pose_solver = PoseSolver()
-
-            if self._camera is None:
-                from .renderer import OrbitCamera
-                self._camera = OrbitCamera()
-                if self._renderer.has_model:
-                    bbox_min, bbox_max = self._renderer.get_bbox()
-                    self._camera.fit_to_bounds(bbox_min, bbox_max)
-
-            self._mocap_running = True
-            self._mocap_start_btn.configure(
-                text="Stop Camera", fg_color="#dc3545", hover_color="#c82333")
-            self._mocap_status.configure(text="Capturing...")
-            self._mocap_tick()
-
-        except Exception as e:
-            logger.error(f"Failed to start MoCap: {e}", exc_info=True)
-            self._mocap_status.configure(text=f"Error: {e}")
-
-    def _mocap_stop(self):
-        self._mocap_running = False
-        if self._mocap_after_id:
-            self.root.after_cancel(self._mocap_after_id)
-            self._mocap_after_id = None
-        if self._mocap:
-            self._mocap.stop()
-        if self._renderer:
-            self._renderer.reset_pose()
-        self._mocap_start_btn.configure(
-            text="Start Camera", fg_color="#28a745", hover_color="#218838")
-        self._mocap_status.configure(text="Camera off")
-        self._mocap_fps_label.configure(text="FPS: --")
-
-    def _mocap_update_mirror(self):
-        if self._mocap:
-            self._mocap.mirror = self._mirror_var.get()
-
-    def _mocap_tick(self):
-        if not self._mocap_running:
-            return
-
-        try:
-            frame, landmarks, world_landmarks = self._mocap.get_latest()
-
-            # Update camera view
-            if frame is not None:
-                cw = max(self._mocap_cam_label.winfo_width(), 200)
-                ch = max(self._mocap_cam_label.winfo_height(), 150)
-                cam_img = frame.resize((cw, ch), PILImage.LANCZOS)
-                ctk_cam = ctk.CTkImage(light_image=cam_img, dark_image=cam_img, size=(cw, ch))
-                self._mocap_cam_label.configure(image=ctk_cam, text="")
-                self._mocap_cam_label._ctk_img = ctk_cam
-
-            # Solve pose and update model
-            use_landmarks = world_landmarks if world_landmarks else landmarks
-            if (use_landmarks and self._pose_solver and self._fbx_data
-                    and self._bone_mapping and self._renderer
-                    and self._renderer.rest_global is not None):
-                from .pose_solver import apply_rotations_to_skeleton
-
-                rotations = self._pose_solver.solve(use_landmarks)
-                if rotations:
-                    new_global = apply_rotations_to_skeleton(
-                        rotations,
-                        self._fbx_data.bones,
-                        self._fbx_data.bone_name_to_index,
-                        self._bone_mapping,
-                        self._renderer.rest_global,
-                    )
-                    self._renderer.set_bone_transforms(new_global)
-
-            # Render model view
-            if self._renderer and self._renderer.has_model and self._camera:
-                mw = max(self._mocap_model_label.winfo_width(), 200)
-                mh = max(self._mocap_model_label.winfo_height(), 150)
-                model_img = self._renderer.render(mw, mh, self._camera)
-                ctk_model = ctk.CTkImage(light_image=model_img, dark_image=model_img, size=(mw, mh))
-                self._mocap_model_label.configure(image=ctk_model, text="")
-                self._mocap_model_label._ctk_img = ctk_model
-
-            # Update FPS
-            fps = self._mocap.fps if self._mocap else 0
-            self._mocap_fps_label.configure(text=f"FPS: {fps:.0f}")
-
-        except Exception as e:
-            logger.warning(f"MoCap tick error: {e}")
-
-        self._mocap_after_id = self.root.after(FRAME_MS, self._mocap_tick)
-
     # ──────────────────── Lifecycle ────────────────────
 
     def _on_close(self):
         self._preview_running = False
-        self._mocap_running = False
         if self._preview_after_id:
             self.root.after_cancel(self._preview_after_id)
-        if self._mocap_after_id:
-            self.root.after_cancel(self._mocap_after_id)
-        if self._mocap:
-            self._mocap.stop()
         if self._renderer:
             self._renderer.cleanup()
         self.root.destroy()
