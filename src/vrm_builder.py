@@ -250,33 +250,56 @@ class VRMBuilder:
             logger.warning("No bones found in FBX data")
             return
 
-        # Create a glTF node for each bone
-        for bi, bone in enumerate(bones):
-            node = Node(name=bone.name)
+        if self._flip_forward:
+            # Normalized skeleton for cluster: compute world positions from
+            # original hierarchy, apply Ry180, then output nodes with identity
+            # rotations and position-only translations.  This avoids any bone
+            # rotation that cluster/UniVRM might misinterpret.
+            n = len(bones)
+            global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
+            for i, bone in enumerate(bones):
+                local = bone.local_transform.copy()
+                if self._height_scale != 1.0:
+                    local[:3, 3] *= self._height_scale
+                if bone.parent_index < 0:
+                    global_xforms[i] = local
+                else:
+                    global_xforms[i] = global_xforms[bone.parent_index] @ local
 
-            local_xform = bone.local_transform.copy()
+            # Extract world positions and apply 180° Y flip
+            world_pos = global_xforms[:, :3, 3].copy()
+            world_pos[:, 0] *= -1
+            world_pos[:, 2] *= -1
+            self._flip_world_pos = world_pos  # reused by _build_skin
 
-            # Scale bone translations for target height
-            if self._height_scale != 1.0:
-                local_xform[:3, 3] *= self._height_scale
-
-            # For cluster flip: apply 180° Y rotation to ROOT bones only.
-            # This rotates the entire skeleton consistently (all child globals
-            # get the Ry180 prefix) while preserving non-root local transforms
-            # so that cluster's animation system works correctly.
-            if self._flip_forward and bone.parent_index < 0:
-                local_xform = _FLIP_Y180 @ local_xform
-
-            # Decompose local transform into TRS
-            t, r, s = _decompose_matrix(local_xform)
-            node.translation = t.tolist()
-            node.rotation = r.tolist()  # [x, y, z, w]
-            node.scale = s.tolist()
-
-            self.gltf.nodes.append(node)
-            node_idx = self._node_count
-            self._node_count += 1
-            self._bone_to_node[bi] = node_idx
+            for bi, bone in enumerate(bones):
+                node = Node(name=bone.name)
+                if bone.parent_index < 0:
+                    t = world_pos[bi]
+                else:
+                    t = world_pos[bi] - world_pos[bone.parent_index]
+                node.translation = t.tolist()
+                node.rotation = [0.0, 0.0, 0.0, 1.0]
+                node.scale = [1.0, 1.0, 1.0]
+                self.gltf.nodes.append(node)
+                node_idx = self._node_count
+                self._node_count += 1
+                self._bone_to_node[bi] = node_idx
+        else:
+            # Standard skeleton (no flip)
+            for bi, bone in enumerate(bones):
+                node = Node(name=bone.name)
+                local_xform = bone.local_transform.copy()
+                if self._height_scale != 1.0:
+                    local_xform[:3, 3] *= self._height_scale
+                t, r, s = _decompose_matrix(local_xform)
+                node.translation = t.tolist()
+                node.rotation = r.tolist()  # [x, y, z, w]
+                node.scale = s.tolist()
+                self.gltf.nodes.append(node)
+                node_idx = self._node_count
+                self._node_count += 1
+                self._bone_to_node[bi] = node_idx
 
         # Set children references
         for bi, bone in enumerate(bones):
@@ -418,7 +441,7 @@ class VRMBuilder:
                 positions *= self._height_scale
 
             # Apply 180° Y flip for cluster: negate X and Z of mesh
-            # to match the root bone Ry180 rotation.
+            # to match the normalized skeleton world positions.
             if self._flip_forward:
                 positions[:, 0] *= -1
                 positions[:, 2] *= -1
@@ -510,21 +533,23 @@ class VRMBuilder:
         bones = self.fbx.bones
         joint_nodes = [self._bone_to_node[i] for i in range(len(bones))]
 
-        # Compute global transforms from the node hierarchy (local transforms)
-        # to ensure consistency with the glTF node tree.
-        # Must apply the same scale/flip transforms as _build_skeleton().
+        # Compute global transforms matching _build_skeleton() output.
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
-        for i, bone in enumerate(bones):
-            local_xform = bone.local_transform.copy()
-            if self._height_scale != 1.0:
-                local_xform[:3, 3] *= self._height_scale
-            if self._flip_forward and bone.parent_index < 0:
-                local_xform = _FLIP_Y180 @ local_xform
-            if bone.parent_index < 0:
-                global_xforms[i] = local_xform
-            else:
-                global_xforms[i] = global_xforms[bone.parent_index] @ local_xform
+        if self._flip_forward:
+            # Normalized skeleton: globals are pure translations at flipped positions
+            for i in range(n):
+                global_xforms[i] = np.eye(4, dtype=np.float32)
+                global_xforms[i][:3, 3] = self._flip_world_pos[i]
+        else:
+            for i, bone in enumerate(bones):
+                local_xform = bone.local_transform.copy()
+                if self._height_scale != 1.0:
+                    local_xform[:3, 3] *= self._height_scale
+                if bone.parent_index < 0:
+                    global_xforms[i] = local_xform
+                else:
+                    global_xforms[i] = global_xforms[bone.parent_index] @ local_xform
 
         # Inverse bind matrices = inv(global_transform) for each bone
         ibm_list = []
