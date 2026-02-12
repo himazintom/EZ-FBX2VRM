@@ -125,6 +125,9 @@ class VRMBuilder:
         self._bone_to_node: dict[int, int] = {}
         # VRM humanoid bone entries
         self._vrm_human_bones: list[dict] = []
+        # Normalized world positions (set during _build_skeleton)
+        self._std_world_pos = None
+        self._flip_world_pos = None
 
     def build(self, meta: dict | None = None, callback=None) -> bytes:
         """
@@ -286,16 +289,32 @@ class VRMBuilder:
                 self._node_count += 1
                 self._bone_to_node[bi] = node_idx
         else:
-            # Standard skeleton (no flip)
+            # Standard skeleton — VRM 0.x requires normalized T-pose
+            # (all rotations = identity).  Compute world positions from
+            # original hierarchy, then output translation-only nodes.
+            n = len(bones)
+            global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
+            for i, bone in enumerate(bones):
+                local = bone.local_transform.copy()
+                if self._height_scale != 1.0:
+                    local[:3, 3] *= self._height_scale
+                if bone.parent_index < 0:
+                    global_xforms[i] = local
+                else:
+                    global_xforms[i] = global_xforms[bone.parent_index] @ local
+
+            world_pos = global_xforms[:, :3, 3].copy()
+            self._std_world_pos = world_pos  # reused by _build_skin
+
             for bi, bone in enumerate(bones):
                 node = Node(name=bone.name)
-                local_xform = bone.local_transform.copy()
-                if self._height_scale != 1.0:
-                    local_xform[:3, 3] *= self._height_scale
-                t, r, s = _decompose_matrix(local_xform)
+                if bone.parent_index < 0:
+                    t = world_pos[bi]
+                else:
+                    t = world_pos[bi] - world_pos[bone.parent_index]
                 node.translation = t.tolist()
-                node.rotation = r.tolist()  # [x, y, z, w]
-                node.scale = s.tolist()
+                node.rotation = [0.0, 0.0, 0.0, 1.0]
+                node.scale = [1.0, 1.0, 1.0]
                 self.gltf.nodes.append(node)
                 node_idx = self._node_count
                 self._node_count += 1
@@ -330,6 +349,10 @@ class VRMBuilder:
                 "bone": vrm_name,
                 "node": node_idx,
                 "useDefaultValues": True,
+                "min": {"x": 0, "y": 0, "z": 0},
+                "max": {"x": 0, "y": 0, "z": 0},
+                "center": {"x": 0, "y": 0, "z": 0},
+                "axisLength": 0,
             })
 
     def _build_materials(self):
@@ -536,20 +559,12 @@ class VRMBuilder:
         # Compute global transforms matching _build_skeleton() output.
         n = len(bones)
         global_xforms = np.zeros((n, 4, 4), dtype=np.float32)
-        if self._flip_forward:
-            # Normalized skeleton: globals are pure translations at flipped positions
-            for i in range(n):
-                global_xforms[i] = np.eye(4, dtype=np.float32)
-                global_xforms[i][:3, 3] = self._flip_world_pos[i]
-        else:
-            for i, bone in enumerate(bones):
-                local_xform = bone.local_transform.copy()
-                if self._height_scale != 1.0:
-                    local_xform[:3, 3] *= self._height_scale
-                if bone.parent_index < 0:
-                    global_xforms[i] = local_xform
-                else:
-                    global_xforms[i] = global_xforms[bone.parent_index] @ local_xform
+        # Both paths now use normalized (translation-only) skeleton.
+        # Reconstruct global transforms as pure translation matrices.
+        wp = self._flip_world_pos if self._flip_forward else self._std_world_pos
+        for i in range(n):
+            global_xforms[i] = np.eye(4, dtype=np.float32)
+            global_xforms[i][:3, 3] = wp[i]
 
         # Inverse bind matrices = inv(global_transform) for each bone
         ibm_list = []
@@ -587,18 +602,31 @@ class VRMBuilder:
                 node.skin = 0
 
     def _build_scene(self):
-        """Build the glTF scene with root nodes."""
+        """Build the glTF scene — mesh nodes as children of skeleton root."""
         root_nodes = []
+        skeleton_root = None
 
         # Add root bone node(s)
         for bi, bone in enumerate(self.fbx.bones):
             if bone.parent_index < 0 and bi in self._bone_to_node:
-                root_nodes.append(self._bone_to_node[bi])
+                node_idx = self._bone_to_node[bi]
+                root_nodes.append(node_idx)
+                if skeleton_root is None:
+                    skeleton_root = node_idx
 
-        # Add mesh nodes
-        for i, node in enumerate(self.gltf.nodes):
-            if node.mesh is not None:
-                root_nodes.append(i)
+        # Attach mesh nodes as children of skeleton root (standard VRM hierarchy)
+        if skeleton_root is not None:
+            root_node = self.gltf.nodes[skeleton_root]
+            if root_node.children is None:
+                root_node.children = []
+            for i, node in enumerate(self.gltf.nodes):
+                if node.mesh is not None:
+                    root_node.children.append(i)
+        else:
+            # Fallback: add mesh nodes as scene roots
+            for i, node in enumerate(self.gltf.nodes):
+                if node.mesh is not None:
+                    root_nodes.append(i)
 
         scene = Scene(name="Scene", nodes=root_nodes)
         self.gltf.scenes.append(scene)
@@ -863,14 +891,12 @@ def _gltf_to_dict(gltf: GLTF2) -> dict:
                 nd["mesh"] = node.mesh
             if node.skin is not None:
                 nd["skin"] = node.skin
-            if node.translation and any(v != 0 for v in node.translation):
+            # Always emit TRS — UniVRM needs explicit values for SkeletonBone
+            if node.translation:
                 nd["translation"] = node.translation
-            if node.rotation and not (
-                node.rotation[0] == 0 and node.rotation[1] == 0 and
-                node.rotation[2] == 0 and node.rotation[3] == 1
-            ):
+            if node.rotation:
                 nd["rotation"] = node.rotation
-            if node.scale and not all(abs(v - 1.0) < 1e-6 for v in node.scale):
+            if node.scale:
                 nd["scale"] = node.scale
             d["nodes"].append(nd)
 
